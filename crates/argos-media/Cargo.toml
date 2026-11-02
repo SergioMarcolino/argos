@@ -16,6 +16,15 @@ capture-native = [
     "windows/Win32_Graphics_Dxgi_Common",
     "windows/Win32_Graphics_Gdi",
     "windows/Win32_UI_WindowsAndMessaging",
+    "windows/Win32_Graphics_Dwm",
+    "windows/Win32_System_Threading",
+    "windows/Win32_System_WinRT",
+    "windows/Win32_System_WinRT_Direct3D11",
+    "windows/Win32_System_WinRT_Graphics_Capture",
+    "windows/Graphics_Capture",
+    "windows/Graphics_DirectX",
+    "windows/Graphics_DirectX_Direct3D11",
+    "windows/Foundation",
 ]
 
 [dependencies]

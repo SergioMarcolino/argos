@@ -28,7 +28,7 @@ use windows::Win32::Foundation::{HMODULE, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
@@ -99,8 +99,9 @@ impl Recorder {
 }
 
 /// A staging texture reused across frames. Reallocating one per frame is the
-/// GPU-side churn the old backend paid at capture rate.
-struct Staging {
+/// GPU-side churn the old backend paid at capture rate. `pub(crate)` so the
+/// WGC recorder can share the same readback path.
+pub(crate) struct Staging {
     texture: ID3D11Texture2D,
     width: u32,
     height: u32,
@@ -188,7 +189,12 @@ fn run(
                 if due {
                     if let Some(resource) = resource.as_ref() {
                         let copying = Instant::now();
-                        match readback(&device, &context, resource, &mut staging) {
+                        let texture: Result<ID3D11Texture2D, _> = resource.cast();
+                        match texture
+                            .map_err(|error| format!("ID3D11Texture2D: {error}"))
+                            .and_then(|source| {
+                                readback(&device, &context, &source, &mut staging, None)
+                            }) {
                             Ok(frame) => {
                                 metrics.readback.record(copying.elapsed());
                                 first = false;
@@ -251,7 +257,7 @@ fn run(
 /// A grid left more than one interval behind — a stall, a display mode switch, a
 /// session that just resumed — resyncs to `now` rather than replaying its
 /// backlog, so a catch-up burst cannot happen.
-fn due_at(next_due: &mut Instant, now: Instant, target: Duration) -> bool {
+pub(crate) fn due_at(next_due: &mut Instant, now: Instant, target: Duration) -> bool {
     if now < *next_due {
         return false;
     }
@@ -262,20 +268,23 @@ fn due_at(next_due: &mut Instant, now: Instant, target: Duration) -> bool {
     true
 }
 
-fn readback(
+/// Copies `source` into the staging texture — all of it, or the top-left
+/// `crop` region — and expands the mapped bytes to RGBA.
+///
+/// Shared by the DXGI and WGC recorders: WGC textures can be larger than the
+/// window's content size (the frame pool rounds up), so the caller passes the
+/// region that actually holds the picture.
+pub(crate) fn readback(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
-    resource: &IDXGIResource,
+    source: &ID3D11Texture2D,
     staging: &mut Option<Staging>,
+    crop: Option<(u32, u32)>,
 ) -> Result<Frame, String> {
     unsafe {
-        let source: ID3D11Texture2D = resource
-            .cast()
-            .map_err(|error| format!("ID3D11Texture2D: {error}"))?;
         let mut source_desc = D3D11_TEXTURE2D_DESC::default();
         source.GetDesc(&mut source_desc);
-        let width = source_desc.Width;
-        let height = source_desc.Height;
+        let (width, height) = crop.unwrap_or((source_desc.Width, source_desc.Height));
 
         let needs_alloc = match staging.as_ref() {
             Some(staging) => {
@@ -321,7 +330,24 @@ fn readback(
         let source_resource: ID3D11Resource = source
             .cast()
             .map_err(|error| format!("ID3D11Resource: {error}"))?;
-        context.CopySubresourceRegion(&destination, 0, 0, 0, 0, &source_resource, 0, None);
+        let region = crop.map(|(w, h)| D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: w,
+            bottom: h,
+            back: 1,
+        });
+        context.CopySubresourceRegion(
+            &destination,
+            0,
+            0,
+            0,
+            0,
+            &source_resource,
+            0,
+            region.as_ref().map(|r| r as *const _),
+        );
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         context

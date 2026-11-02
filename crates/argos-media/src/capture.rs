@@ -51,6 +51,21 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
+/// A top-level window the sharer can pick instead of a monitor.
+#[derive(Clone, Debug)]
+pub struct WindowInfo {
+    pub hwnd: isize,
+    pub title: String,
+    pub process: String,
+}
+
+/// What a share captures: a whole monitor, or one window.
+#[derive(Clone, Debug)]
+pub enum CaptureSource {
+    Monitor(MonitorInfo),
+    Window(WindowInfo),
+}
+
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -115,11 +130,11 @@ impl CaptureSession {
         self.error.lock().ok().and_then(|slot| slot.clone())
     }
 
-    pub fn start(&mut self, source: &MonitorInfo) -> Result<(), String> {
+    pub fn start(&mut self, source: &CaptureSource) -> Result<(), String> {
         if self.join.is_some() {
             return Err("capture already running".to_string());
         }
-        let wanted = source.name.clone();
+        let wanted = source.clone();
         let (tx, rx) = sync_channel::<Frame>(2);
         let stop = self.stop.clone();
         let active = self.active.clone();
@@ -184,7 +199,7 @@ impl Default for CaptureSession {
 /// loss. Only a persistent failure streak is reported as fatal.
 #[allow(clippy::too_many_arguments)]
 fn pump(
-    wanted: String,
+    wanted: CaptureSource,
     tx: SyncSender<Frame>,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
@@ -210,7 +225,16 @@ fn pump(
             metrics: Arc::clone(&metrics),
             cursor: Arc::clone(&cursor),
         };
-        let mut recorder = match Recorder::start(&wanted, tx.clone(), control) {
+        // A window that no longer exists can never come back; reporting it
+        // immediately beats the 30 s retry window for a mistake the user can
+        // see and fix.
+        if let CaptureSource::Window(window) = &wanted {
+            if !crate::wgc::window_exists(window.hwnd) {
+                set_capture_error(&error, "the shared window was closed".to_string());
+                return;
+            }
+        }
+        let mut recorder = match start_recorder(&wanted, tx.clone(), control) {
             Ok(recorder) => recorder,
             Err(reason) => {
                 if failure_exhausted(&mut failed_since, connected_at) {
@@ -245,6 +269,40 @@ fn pump(
             return;
         }
         backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+    }
+}
+
+/// Dispatches to the recorder matching the source. Monitors keep the DXGI
+/// path untouched; windows go through WGC. Both share the `wait() -> bool`
+/// contract: `true` means the thread died on its own.
+enum AnyRecorder {
+    Monitor(Recorder),
+    #[cfg(feature = "capture-native")]
+    Window(crate::wgc::Recorder),
+}
+
+impl AnyRecorder {
+    fn wait(&mut self) -> bool {
+        match self {
+            Self::Monitor(r) => r.wait(),
+            #[cfg(feature = "capture-native")]
+            Self::Window(r) => r.wait(),
+        }
+    }
+}
+
+fn start_recorder(
+    source: &CaptureSource,
+    tx: SyncSender<Frame>,
+    control: Control,
+) -> Result<AnyRecorder, String> {
+    match source {
+        CaptureSource::Monitor(m) => {
+            Recorder::start(&m.name, tx, control).map(AnyRecorder::Monitor)
+        }
+        CaptureSource::Window(w) => {
+            crate::wgc::Recorder::start(w.hwnd, tx, control).map(AnyRecorder::Window)
+        }
     }
 }
 
@@ -297,6 +355,16 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
     crate::dxgi::list_monitors()
 }
 
+/// The top-level windows a sharer may pick, for the source picker.
+pub fn list_windows() -> Vec<WindowInfo> {
+    crate::wgc::list_windows()
+}
+
+/// Whether single-window capture can run here at all.
+pub fn window_capture_supported() -> bool {
+    crate::wgc::window_capture_supported()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,7 +391,9 @@ mod tests {
         );
 
         let mut session = CaptureSession::new();
-        session.start(primary).expect("capture should start");
+        session
+            .start(&CaptureSource::Monitor(primary.clone()))
+            .expect("capture should start");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let frame = loop {
