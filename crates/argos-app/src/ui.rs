@@ -11,7 +11,7 @@ use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics};
 use argos_core::quality::{Controller as QualityController, Decision, Report};
 use argos_core::{lan, session, Packet};
 use argos_media::audio::{AudioCapture, AudioPlayback, AudioSender, OpusAudioEncoder};
-use argos_media::capture::{self, CaptureSession, MonitorInfo};
+use argos_media::capture::CaptureSession;
 use argos_media::decode::{DecodeSink, DecodedFrame};
 use argos_media::encode::{
     encode_target, EncodeMsg, EncodeWorker, H264Encoder, KEYFRAME_REQUEST_FLOOR,
@@ -20,6 +20,7 @@ use argos_media::encode::{
 use crate::chat::{ChatArgs, ChatPanel};
 use crate::config::{self, AppConfig};
 use crate::networks::Networks;
+use crate::source::SourcePicker;
 
 /// How often the viewer may ask for a keyframe.
 ///
@@ -1354,8 +1355,7 @@ pub struct ArgosApp {
     metrics_error: Option<String>,
     name_input: String,
     code_input: String,
-    monitors: Vec<MonitorInfo>,
-    selected_monitor: usize,
+    source: SourcePicker,
     capture: Option<CaptureSession>,
     preview: Option<Preview>,
     preview_active: bool,
@@ -1443,8 +1443,7 @@ impl ArgosApp {
             icon,
             name_input: config.name.clone(),
             code_input: String::new(),
-            monitors: Vec::new(),
-            selected_monitor: 0,
+            source: SourcePicker::new(),
             capture: None,
             preview: None,
             preview_active: false,
@@ -1741,15 +1740,7 @@ impl ArgosApp {
     }
 
     fn refresh_monitors(&mut self) {
-        self.monitors = capture::list_monitors();
-        if !self.monitors.is_empty() {
-            self.selected_monitor = self.selected_monitor.min(self.monitors.len() - 1);
-        }
-    }
-
-    fn monitor_label(info: &MonitorInfo) -> String {
-        let primary = if info.is_primary { " [primary]" } else { "" };
-        format!("{} ({}x{}){}", info.name, info.width, info.height, primary)
+        self.source.refresh();
     }
 
     fn quality_label(height: Option<u32>) -> &'static str {
@@ -1765,18 +1756,18 @@ impl ArgosApp {
         Duration::from_micros(1_000_000 / self.frame_rate.max(1) as u64)
     }
 
-    fn start_capture(&mut self) -> Result<Option<MonitorInfo>, String> {
-        let Some(source) = self.monitors.get(self.selected_monitor) else {
-            return Ok(None);
+    fn start_capture(&mut self) -> Result<(), String> {
+        let Some(source) = self.source.source() else {
+            return Err("no capture source".to_string());
         };
         let mut session = CaptureSession::new();
         session.set_interval(self.frame_interval());
-        session.start(source)?;
+        session.start(&source)?;
         self.fps_last = Instant::now();
         self.fps_frames = 0;
         self.fps = 0.0;
         self.capture = Some(session);
-        Ok(Some(source.clone()))
+        Ok(())
     }
 
     fn toggle_preview(&mut self) {
@@ -3138,12 +3129,12 @@ impl ArgosApp {
         let mut do_stop_live = false;
         let mut do_preview = false;
 
-        if self.monitors.is_empty() {
+        if self.source.source().is_none() {
             self.refresh_monitors();
         }
-        if self.monitors.is_empty() {
+        if self.source.source().is_none() {
             ui.heading("Share");
-            ui.label(RichText::new("No monitor found").color(theme::ERR));
+            ui.label(RichText::new("No monitor or window found").color(theme::ERR));
             return;
         }
 
@@ -3161,22 +3152,7 @@ impl ArgosApp {
             do_go_live = true;
         }
 
-        let selected = self.selected_monitor.min(self.monitors.len() - 1);
-        egui::ComboBox::from_label("Monitor")
-            .selected_text(Self::monitor_label(&self.monitors[selected]))
-            .show_ui(ui, |ui| {
-                for (index, monitor) in self.monitors.iter().enumerate() {
-                    if ui
-                        .selectable_label(
-                            self.selected_monitor == index,
-                            Self::monitor_label(monitor),
-                        )
-                        .clicked()
-                    {
-                        self.selected_monitor = index;
-                    }
-                }
-            });
+        self.source.picker(ui, self.capture.is_some());
 
         // Adaptive resolution is the primary control and stays in the open: it
         // starts at the ceiling and walks down only as far as the link and the
@@ -4766,6 +4742,11 @@ impl eframe::App for ArgosApp {
                 Duration::from_millis(250)
             });
         }
+        // Side panels must exist before the central panel claims the whole
+        // window, or the chat history renders under the content.
+        if self.show_chat && !fullscreen {
+            self.show_chat_panel(ctx);
+        }
         if fullscreen {
             self.fullscreen_view(ctx);
         } else {
@@ -4787,11 +4768,8 @@ impl eframe::App for ArgosApp {
         if self.show_settings && !fullscreen {
             self.settings_window(ctx);
         }
-        // The chat panel and the networks window are part of the normal
-        // chrome; fullscreen video owns the whole window.
-        if self.show_chat && !fullscreen {
-            self.show_chat_panel(ctx);
-        }
+        // The networks window is part of the normal chrome; fullscreen video
+        // owns the whole window.
         if !fullscreen {
             self.networks
                 .window(ctx, &mut self.config, &self.allowed, self.lan.as_ref());

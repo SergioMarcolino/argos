@@ -11,6 +11,7 @@ mod chat;
 mod config;
 mod networks;
 mod radmin;
+mod source;
 mod ui;
 
 use eframe::egui;
