@@ -410,3 +410,70 @@ fn the_allowed_filter_decides_who_is_a_peer() {
     assert!(!is_allowed(&Some(HashSet::new()), ip));
 }
 
+/// The whole discovery path on one machine: two Lans sharing the broadcast
+/// port (SO_REUSEADDR) should hear each other's hello, advertise their chat
+/// ports, and a chat sent to the advertised port should arrive.
+///
+/// This runs the real sockets, so it is the one test that proves the pieces
+/// actually connect rather than only agreeing on a format.
+#[test]
+fn two_lans_discover_each_other_and_chat() {
+    use crate::chat::{Chat, ChatEvent, ChatKind, ChatMessage};
+    use crate::lan::Lan;
+    use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
+
+    let allowed: super::Allowed = Arc::new(RwLock::new(None));
+    let chat_a = Chat::start(allowed.clone()).expect("chat a");
+    let chat_b = Chat::start(allowed.clone()).expect("chat b");
+    let lan_a = Lan::start("alpha".to_string(), chat_a.port(), allowed.clone()).expect("lan a");
+    // Kept alive by binding; its beacon is what `lan_a` is listening for.
+    let _lan_b = Lan::start("bravo".to_string(), chat_b.port(), allowed).expect("lan b");
+
+    // Beacons go out every 2 s; give discovery a generous window.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let port_b = loop {
+        if let Some(peer) = lan_a.peers().iter().find(|p| p.name == "bravo") {
+            break peer.chat_port;
+        }
+        assert!(Instant::now() < deadline, "alpha never saw bravo");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(port_b, chat_b.port(), "hello did not carry the chat port");
+
+    let target = std::net::SocketAddr::new(
+        lan_a
+            .peers()
+            .iter()
+            .find(|p| p.name == "bravo")
+            .expect("peer")
+            .addr
+            .ip(),
+        port_b,
+    );
+    chat_a.send(
+        vec![("bravo".to_string(), target)],
+        ChatMessage::new(
+            "a".to_string(),
+            "alpha".to_string(),
+            ChatKind::Text {
+                text: "smoke".to_string(),
+            },
+            Vec::new(),
+        ),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(ChatEvent::Received { message, .. }) = chat_b.try_event() {
+            assert_eq!(
+                message.kind,
+                ChatKind::Text {
+                    text: "smoke".to_string()
+                }
+            );
+            return;
+        }
+        assert!(Instant::now() < deadline, "chat never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
