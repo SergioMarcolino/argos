@@ -59,6 +59,21 @@ fn read_allowed(allowed: &Allowed) -> Option<HashSet<Ipv4Addr>> {
     allowed.read().ok().and_then(|set| set.clone())
 }
 
+/// Which address an existing peer entry keeps after a new hello.
+///
+/// A peer reachable on two networks (the physical LAN and Radmin) sends
+/// hellos from both source addresses, and whichever arrived last would win —
+/// so under a profile filter the peer would flicker in and out of `peers()`
+/// as the sources alternate. A source that fails the filter never replaces
+/// one that passes; everything else about the entry still refreshes.
+fn keep_addr(old: SocketAddr, new: SocketAddr, allowed: &Option<HashSet<Ipv4Addr>>) -> SocketAddr {
+    if is_allowed(allowed, new.ip()) {
+        new
+    } else {
+        old
+    }
+}
+
 #[derive(Debug)]
 pub enum LanEvent {
     Request {
@@ -746,21 +761,23 @@ fn discovery_loop(
                     continue;
                 }
                 if let Ok(mut peers) = peers.lock() {
-                    peers.insert(
-                        message.id.clone(),
-                        LanPeer {
-                            id: message.id,
-                            name: if message.name.trim().is_empty() {
-                                "Unnamed".to_string()
-                            } else {
-                                message.name
-                            },
-                            addr: SocketAddr::new(addr.ip(), message.port),
-                            chat_port: message.chat_port,
-                            sharing: message.sharing,
-                            last_seen: Instant::now(),
+                    let allowed_now = read_allowed(&allowed);
+                    let mut peer = LanPeer {
+                        id: message.id.clone(),
+                        name: if message.name.trim().is_empty() {
+                            "Unnamed".to_string()
+                        } else {
+                            message.name
                         },
-                    );
+                        addr: SocketAddr::new(addr.ip(), message.port),
+                        chat_port: message.chat_port,
+                        sharing: message.sharing,
+                        last_seen: Instant::now(),
+                    };
+                    if let Some(prev) = peers.get(&peer.id) {
+                        peer.addr = keep_addr(prev.addr, peer.addr, &allowed_now);
+                    }
+                    peers.insert(message.id, peer);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

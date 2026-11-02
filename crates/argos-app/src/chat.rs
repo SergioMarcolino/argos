@@ -23,6 +23,12 @@ use crate::ui::theme;
 /// included — a long session cannot be allowed to grow without bound.
 const HISTORY_CAP: usize = 300;
 
+/// The most attachment bytes the history may retain. 300 entries × 25 MiB
+/// would be gigabytes, so once the total passes this, the oldest attachments
+/// shed their bytes — the entry, its thumbnail and its "not delivered" marks
+/// all stay; only the original data goes.
+const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
+
 /// The largest edge a stored image texture may have. Big enough to read text
 /// in a screenshot, small enough that a busy image chat does not eat the GPU.
 const MAX_TEXTURE_EDGE: u32 = 1280;
@@ -48,15 +54,21 @@ enum Content {
     Text(String),
     Image {
         name: String,
-        /// The original bytes — what Save writes.
+        /// The original bytes — what Save writes. Dropped once evicted.
         data: Vec<u8>,
+        /// The bytes were shed to stay under `MAX_HISTORY_BYTES`.
+        evicted: bool,
         /// Filled in once the background decode finishes.
         texture: Option<egui::TextureHandle>,
         decoding: bool,
     },
     File {
         name: String,
+        /// The original bytes; dropped once evicted.
         data: Vec<u8>,
+        /// The size at arrival, kept after `data` is evicted.
+        size: u64,
+        evicted: bool,
     },
     /// A divider, e.g. switching networks.
     System(String),
@@ -87,6 +99,8 @@ pub struct ChatArgs<'a> {
 #[derive(Default)]
 pub struct ChatPanel {
     entries: Vec<Entry>,
+    /// Total attachment bytes the entries still hold, for `MAX_HISTORY_BYTES`.
+    retained: usize,
     input: String,
     /// Inline composer feedback: oversize attachment, unreadable file.
     error: Option<String>,
@@ -122,13 +136,16 @@ impl ChatPanel {
                 Content::Image {
                     name: name.clone(),
                     data: message.data.clone(),
+                    evicted: false,
                     texture: None,
                     decoding: true,
                 }
             }
             ChatKind::File { name } => Content::File {
                 name: name.clone(),
+                size: message.data.len() as u64,
                 data: message.data.clone(),
+                evicted: false,
             },
         };
         self.push(Entry {
@@ -164,11 +181,30 @@ impl ChatPanel {
     }
 
     fn push(&mut self, entry: Entry) {
+        self.retained += attachment_bytes(&entry.content);
         self.entries.push(entry);
         // Dropping an entry drops its texture with it — `TextureHandle` frees
         // on drop — so the cap bounds GPU memory too.
         if self.entries.len() > HISTORY_CAP {
-            self.entries.remove(0);
+            let removed = self.entries.remove(0);
+            self.retained = self
+                .retained
+                .saturating_sub(attachment_bytes(&removed.content));
+        }
+        self.enforce_budget();
+    }
+
+    /// Sheds the bytes of the oldest attachments until the history is back
+    /// under `MAX_HISTORY_BYTES`.
+    fn enforce_budget(&mut self) {
+        let mut index = 0;
+        while self.retained > MAX_HISTORY_BYTES && index < self.entries.len() {
+            let freed = evict(&mut self.entries[index].content);
+            if freed == 0 {
+                index += 1;
+            } else {
+                self.retained -= freed;
+            }
         }
     }
 
@@ -310,12 +346,7 @@ impl ChatPanel {
     fn read_file(&mut self, path: PathBuf) {
         let tx = self.picked_sender();
         thread::spawn(move || {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string());
-            let result = std::fs::read(&path).map_err(|e| format!("{name}: {e}"));
-            let _ = tx.send(PickedFile { name, result });
+            let _ = tx.send(read_attachment(&path));
         });
     }
 
@@ -336,12 +367,7 @@ impl ChatPanel {
                     });
                 }
                 Some(path) => {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "file".to_string());
-                    let result = std::fs::read(&path).map_err(|e| format!("{name}: {e}"));
-                    let _ = tx.send(PickedFile { name, result });
+                    let _ = tx.send(read_attachment(&path));
                 }
             }
         });
@@ -371,6 +397,7 @@ impl ChatPanel {
             Content::Image {
                 name,
                 data,
+                evicted,
                 texture,
                 decoding,
             } => {
@@ -394,11 +421,24 @@ impl ChatPanel {
                         );
                     }
                 }
-                Self::save_row(ui, data, name, &mut entry.saved);
+                if *evicted {
+                    ui.label(RichText::new("No longer in memory").weak());
+                } else {
+                    Self::save_row(ui, data, name, &mut entry.saved);
+                }
             }
-            Content::File { name, data } => {
-                ui.label(format!("{}  ({})", name, human_size(data.len() as u64)));
-                Self::save_row(ui, data, name, &mut entry.saved);
+            Content::File {
+                name,
+                data,
+                size,
+                evicted,
+            } => {
+                ui.label(format!("{}  ({})", name, human_size(*size)));
+                if *evicted {
+                    ui.label(RichText::new("No longer in memory").weak());
+                } else {
+                    Self::save_row(ui, data, name, &mut entry.saved);
+                }
             }
             Content::System(_) => {}
         }
@@ -481,13 +521,19 @@ impl ChatPanel {
                 if ui.small_button("Attach…").clicked() {
                     self.open_dialog();
                 }
-                let send_pressed =
-                    ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                // Enter sends; Shift+Enter is a newline. The key must be eaten
+                // before the TextEdit sees it, or the send also inserts the
+                // newline mid-message — and the press only counts when the
+                // composer has focus, checked through its stable id.
+                let edit_id = ui.id().with("composer");
+                let send_pressed = ui.memory(|m| m.has_focus(edit_id))
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
                 let edit = egui::TextEdit::multiline(&mut self.input)
+                    .id(edit_id)
                     .hint_text("Message — Enter to send, Shift+Enter for a new line")
                     .desired_rows(2);
                 let response = ui.add(edit);
-                if send_pressed && response.has_focus() {
+                if send_pressed {
                     self.send_text(args);
                     response.request_focus();
                 }
@@ -500,14 +546,16 @@ impl ChatPanel {
 
     fn send_text(&mut self, args: &ChatArgs<'_>) {
         let text = self.input.trim().to_string();
-        self.input.clear();
         if text.is_empty() {
             return;
         }
+        // The draft stays until a send succeeds — an over-cap message is an
+        // error to show, not a reason to delete what the user typed.
         if text.chars().count() > MAX_TEXT_CHARS {
             self.error = Some(format!("Message is over {MAX_TEXT_CHARS} characters"));
             return;
         }
+        self.input.clear();
         self.error = None;
         let message = ChatMessage::new(
             args.my_id.to_string(),
@@ -545,11 +593,17 @@ impl ChatPanel {
             Content::Image {
                 name,
                 data,
+                evicted: false,
                 texture: None,
                 decoding: true,
             }
         } else {
-            Content::File { name, data }
+            Content::File {
+                name,
+                size: data.len() as u64,
+                data,
+                evicted: false,
+            }
         };
         self.deliver(args, message, content);
     }
@@ -578,6 +632,29 @@ impl ChatPanel {
             let result = decode_image(&data);
             let _ = tx.send((msg_id, result));
         });
+    }
+}
+
+/// The attachment bytes an entry still holds. Text and system lines hold
+/// none; an evicted attachment's bytes are already gone.
+fn attachment_bytes(content: &Content) -> usize {
+    match content {
+        Content::Image { data, .. } | Content::File { data, .. } => data.len(),
+        _ => 0,
+    }
+}
+
+/// Drops an attachment's bytes, returning how many were freed. `0` for text,
+/// system lines, and attachments already shed.
+fn evict(content: &mut Content) -> usize {
+    match content {
+        Content::Image { data, evicted, .. } | Content::File { data, evicted, .. } if !*evicted => {
+            let freed = data.len();
+            *data = Vec::new();
+            *evicted = true;
+            freed
+        }
+        _ => 0,
     }
 }
 
@@ -718,6 +795,24 @@ fn decode_image(data: &[u8]) -> Result<egui::ColorImage, String> {
     Ok(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
 }
 
+/// Reads a file for sending, checking its size before its bytes: a multi-GB
+/// drop must fail on the metadata alone rather than being pulled into memory
+/// first.
+fn read_attachment(path: &std::path::Path) -> PickedFile {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let result = match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_ATTACHMENT_BYTES as u64 => {
+            Err(format!("{name} is over the 25 MB limit"))
+        }
+        Ok(_) => std::fs::read(path).map_err(|e| format!("{name}: {e}")),
+        Err(e) => Err(format!("{name}: {e}")),
+    };
+    PickedFile { name, result }
+}
+
 /// The clipboard's image, re-encoded as PNG so it travels as a file format
 /// rather than raw pixels.
 fn clipboard_png() -> Result<Vec<u8>, String> {
@@ -808,6 +903,29 @@ mod tests {
         for name in ["a.exe", "b.txt", "pngfile", "c.png.txt"] {
             assert!(!is_image_name(name), "{name}");
         }
+    }
+
+    /// Over-budget attachments shed only their bytes: the entry, and the fact
+    /// it was an attachment, survive — and a second call frees nothing.
+    #[test]
+    fn eviction_drops_bytes_but_keeps_the_entry() {
+        let mut file = Content::File {
+            name: "big.bin".to_string(),
+            data: vec![7u8; 1024],
+            size: 1024,
+            evicted: false,
+        };
+        assert_eq!(attachment_bytes(&file), 1024);
+        assert_eq!(evict(&mut file), 1024);
+        assert_eq!(attachment_bytes(&file), 0);
+        assert!(matches!(file, Content::File { evicted: true, .. }));
+        assert_eq!(evict(&mut file), 0);
+
+        // Text and system lines are never budget food.
+        let mut text = Content::Text("hi".to_string());
+        assert_eq!(evict(&mut text), 0);
+        let mut system = Content::System("— x —".to_string());
+        assert_eq!(evict(&mut system), 0);
     }
 
     /// Hidden accumulates; visible does not. The count is the button label's

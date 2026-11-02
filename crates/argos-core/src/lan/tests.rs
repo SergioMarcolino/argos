@@ -410,6 +410,30 @@ fn the_allowed_filter_decides_who_is_a_peer() {
     assert!(!is_allowed(&Some(HashSet::new()), ip));
 }
 
+/// A peer heard from two source addresses must not flicker: a hello from a
+/// filtered-out source updates the entry's freshness but never replaces the
+/// allowed address it had. This is the bug behind a peer vanishing and
+/// returning on a multi-network machine.
+#[test]
+fn a_filtered_out_hello_never_steals_the_peers_address() {
+    use super::keep_addr;
+    use std::net::SocketAddr;
+
+    let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(26, 0, 0, 7)), 45893);
+    let lan_side = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 45893);
+    let set: HashSet<Ipv4Addr> = [Ipv4Addr::new(26, 0, 0, 7)].into_iter().collect();
+
+    assert_eq!(keep_addr(good, lan_side, &Some(set.clone())), good);
+    // An allowed source still wins: the port may legitimately change.
+    assert_eq!(
+        keep_addr(lan_side, good, &Some(set)),
+        good,
+        "the allowed address must win once seen"
+    );
+    // No filter at all: latest always wins, as before.
+    assert_eq!(keep_addr(good, lan_side, &None), lan_side);
+}
+
 /// The whole discovery path on one machine: two Lans sharing the broadcast
 /// port (SO_REUSEADDR) should hear each other's hello, advertise their chat
 /// ports, and a chat sent to the advertised port should arrive.

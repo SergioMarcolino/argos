@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -31,6 +31,10 @@ const VERSION: u32 = 1;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The most inbound connections being read at once. Each holds a thread and
+/// up to 25 MiB of attachment, so a flood cannot be allowed to multiply
+/// unbounded — the rest are closed on arrival and simply try again later.
+const MAX_CONNECTIONS: usize = 16;
 
 /// What a message carries. The wire tag is the `type` field of the JSON
 /// header, so adding a kind later does not move any other field.
@@ -261,14 +265,26 @@ fn listen_loop(
     allowed: Allowed,
     events: Sender<ChatEvent>,
 ) {
+    let in_flight = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, addr)) => {
                 if !is_allowed(&allowed.read().ok().and_then(|set| set.clone()), addr.ip()) {
                     continue;
                 }
+                if in_flight.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    continue;
+                }
+                in_flight.fetch_add(1, Ordering::Relaxed);
                 let events = events.clone();
+                let in_flight = Arc::clone(&in_flight);
                 thread::spawn(move || {
+                    let _guard = ConnGuard(in_flight);
+                    // On Windows an accepted socket inherits the listener's
+                    // non-blocking mode: without this reset, `read_exact`
+                    // returns WouldBlock the moment a frame is not fully
+                    // buffered, which is every real attachment.
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
                     let mut stream = stream;
                     if let Ok(message) = read_frame(&mut stream) {
@@ -284,6 +300,15 @@ fn listen_loop(
             }
             Err(_) => break,
         }
+    }
+}
+
+/// Returns the connection slot to the count when a reader thread exits.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -444,6 +469,41 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "no message within 2 s");
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A frame big enough that it cannot possibly arrive in one buffer: the
+    /// reader must keep reading across partial reads, which is what the
+    /// `set_nonblocking(false)` reset exists for — without it a Windows
+    /// accepted socket inherits the listener's non-blocking mode and this
+    /// read returns WouldBlock on the first partial chunk.
+    #[test]
+    fn a_multi_mebibyte_attachment_arrives_byte_exact() {
+        let chat = Chat::start(allowed_none()).expect("chat starts");
+        let data: Vec<u8> = (0..8 * 1024 * 1024u64).map(|i| (i % 251) as u8).collect();
+        let message = ChatMessage::new(
+            "aaaa".to_string(),
+            "desk".to_string(),
+            ChatKind::File {
+                name: "big.bin".to_string(),
+            },
+            data.clone(),
+        );
+        chat.send(
+            vec![(
+                "self".to_string(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), chat.port()),
+            )],
+            message,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(ChatEvent::Received { message: got, .. }) = chat.try_event() {
+                assert_eq!(got.data, data);
+                return;
+            }
+            assert!(Instant::now() < deadline, "no message within 10 s");
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
