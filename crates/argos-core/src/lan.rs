@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,8 +21,42 @@ pub struct LanPeer {
     pub id: String,
     pub name: String,
     pub addr: SocketAddr,
+    /// The port their chat listener answers on, from their hello. `0` means a
+    /// build that has no chat — old builds never send the field.
+    pub chat_port: u16,
     pub sharing: bool,
     pub last_seen: Instant,
+}
+
+/// The peer filter, shared between the app and the discovery loop.
+///
+/// `None` is "no profile selected" and admits everyone. `Some` is an IP allow
+/// list from the active network profile — `Some` with an empty set is a real
+/// profile with no addresses in it yet, which admits nobody. The `RwLock` lets
+/// the UI swap the whole set on a profile switch without restarting `Lan`.
+pub type Allowed = Arc<RwLock<Option<HashSet<Ipv4Addr>>>>;
+
+/// Whether a source address passes the filter.
+///
+/// `None` admits everyone. Under `Some`, only listed IPv4 addresses pass: an
+/// IPv6 source can never be in the set, so it is refused rather than treated
+/// as "not filtered".
+pub fn is_allowed(allowed: &Option<HashSet<Ipv4Addr>>, ip: IpAddr) -> bool {
+    match allowed {
+        None => true,
+        Some(set) => match ip {
+            IpAddr::V4(v4) => set.contains(&v4),
+            IpAddr::V6(_) => false,
+        },
+    }
+}
+
+/// The filter's current value, cloned out from under the lock.
+///
+/// Threads take a copy rather than holding the lock across a socket call, so a
+/// stalled writer can never wedge a receive loop.
+fn read_allowed(allowed: &Allowed) -> Option<HashSet<Ipv4Addr>> {
+    allowed.read().ok().and_then(|set| set.clone())
 }
 
 #[derive(Debug)]
@@ -253,6 +287,9 @@ struct Message {
     to: String,
     #[serde(default)]
     port: u16,
+    /// The sender's chat listener port, in the `hello` message.
+    #[serde(default)]
+    chat_port: u16,
     #[serde(default)]
     sharing: bool,
     #[serde(default)]
@@ -281,6 +318,8 @@ pub struct Lan {
     id: String,
     signal: Arc<UdpSocket>,
     signal_port: u16,
+    chat_port: u16,
+    allowed: Allowed,
     peers: Arc<Mutex<HashMap<String, LanPeer>>>,
     events: Receiver<LanEvent>,
     name: Arc<Mutex<String>>,
@@ -291,7 +330,11 @@ pub struct Lan {
 }
 
 impl Lan {
-    pub fn start(name: String) -> Result<Self, String> {
+    /// `chat_port` is the local chat listener's port, announced in every hello
+    /// so peers know where to deliver chat. `allowed` is the shared network
+    /// filter: it is consulted fresh on every read, so swapping its contents
+    /// changes who counts as a peer without restarting discovery.
+    pub fn start(name: String, chat_port: u16, allowed: Allowed) -> Result<Self, String> {
         let discovery = Arc::new(bind_discovery(DISCOVERY_PORT)?);
         let signal = Arc::new(bind_signal()?);
         let signal_port = signal.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -311,6 +354,7 @@ impl Lan {
         let discovery_sharing = Arc::clone(&sharing);
         let discovery_local = Arc::clone(&local);
         let discovery_stop = Arc::clone(&stop);
+        let discovery_allowed = Arc::clone(&allowed);
         let discovery_id = id.clone();
         joins.push(
             thread::Builder::new()
@@ -323,8 +367,10 @@ impl Lan {
                         discovery_sharing,
                         discovery_local,
                         discovery_stop,
+                        discovery_allowed,
                         discovery_id,
                         signal_port,
+                        chat_port,
                     )
                 })
                 .map_err(|error| error.to_string())?,
@@ -332,11 +378,20 @@ impl Lan {
 
         let signal_thread = Arc::clone(&signal);
         let signal_stop = Arc::clone(&stop);
+        let signal_allowed = Arc::clone(&allowed);
         let signal_id = id.clone();
         joins.push(
             thread::Builder::new()
                 .name("argos-lan-signal".to_string())
-                .spawn(move || signal_loop(signal_thread, signal_stop, signal_id, events_tx))
+                .spawn(move || {
+                    signal_loop(
+                        signal_thread,
+                        signal_stop,
+                        signal_allowed,
+                        signal_id,
+                        events_tx,
+                    )
+                })
                 .map_err(|error| error.to_string())?,
         );
 
@@ -344,6 +399,8 @@ impl Lan {
             id,
             signal,
             signal_port,
+            chat_port,
+            allowed,
             peers,
             events,
             name,
@@ -372,7 +429,25 @@ impl Lan {
         self.sharing.store(sharing, Ordering::Relaxed);
     }
 
+    /// The peers the active network admits, sorted by name.
+    ///
+    /// The raw map stores everyone heard on the VPN — the network editor needs
+    /// the unfiltered view to offer "add this address" — so the filter is
+    /// applied here, on the way out.
     pub fn peers(&self) -> Vec<LanPeer> {
+        let allowed = read_allowed(&self.allowed);
+        let mut list = self.recent_peers();
+        list.retain(|peer| is_allowed(&allowed, peer.addr.ip()));
+        list
+    }
+
+    /// Everyone heard on the VPN, regardless of the active network's filter.
+    pub fn all_peers(&self) -> Vec<LanPeer> {
+        self.recent_peers()
+    }
+
+    /// The live peers in the raw map, before any filtering.
+    fn recent_peers(&self) -> Vec<LanPeer> {
         let Ok(peers) = self.peers.lock() else {
             return Vec::new();
         };
@@ -398,6 +473,11 @@ impl Lan {
         let Some(addr) = addr else {
             return;
         };
+        // A peer outside the active network gets nothing sent to it, which is
+        // the same treatment incoming datagrams from it get in `signal_loop`.
+        if !is_allowed(&read_allowed(&self.allowed), addr.ip()) {
+            return;
+        }
         if let Ok(json) = serde_json::to_vec(&message) {
             let _ = self.signal.send_to(&json, addr);
         }
@@ -410,6 +490,7 @@ impl Lan {
             name: String::new(),
             to: to.to_string(),
             port: self.signal_port,
+            chat_port: self.chat_port,
             sharing: false,
             sdp: String::new(),
             loss: 0.0,
@@ -543,7 +624,7 @@ fn bind_signal() -> Result<UdpSocket, String> {
     Ok(socket.into())
 }
 
-fn random_id() -> String {
+pub(crate) fn random_id() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = RandomState::new().build_hasher();
@@ -600,8 +681,10 @@ fn discovery_loop(
     sharing: Arc<AtomicBool>,
     local: Arc<Mutex<Option<Ipv4Addr>>>,
     stop: Arc<AtomicBool>,
+    allowed: Allowed,
     id: String,
     signal_port: u16,
+    chat_port: u16,
 ) {
     let targets = broadcast_targets();
     let mut buffer = [0u8; 8192];
@@ -620,6 +703,7 @@ fn discovery_loop(
                 name: current_name,
                 to: String::new(),
                 port: signal_port,
+                chat_port,
                 sharing: sharing.load(Ordering::Relaxed),
                 sdp: String::new(),
                 loss: 0.0,
@@ -632,6 +716,16 @@ fn discovery_loop(
             if let Ok(json) = serde_json::to_vec(&message) {
                 for target in &targets {
                     let _ = socket.send_to(&json, target);
+                }
+                // Radmin networks do not reliably carry the broadcast the
+                // targets above rely on, so every address in the active
+                // profile also gets the hello unicast. `None` means no profile
+                // is selected and there is nobody specific to aim at.
+                if let Some(set) = read_allowed(&allowed) {
+                    for ip in set {
+                        let _ =
+                            socket.send_to(&json, SocketAddr::new(IpAddr::V4(ip), DISCOVERY_PORT));
+                    }
                 }
             }
             if let Ok(mut peers) = peers.lock() {
@@ -662,6 +756,7 @@ fn discovery_loop(
                                 message.name
                             },
                             addr: SocketAddr::new(addr.ip(), message.port),
+                            chat_port: message.chat_port,
                             sharing: message.sharing,
                             last_seen: Instant::now(),
                         },
@@ -740,14 +835,21 @@ fn dispatch(message: Message) -> Option<LanEvent> {
 fn signal_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
+    allowed: Allowed,
     id: String,
     events: Sender<LanEvent>,
 ) {
     let mut buffer = [0u8; 65536];
     while !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buffer) {
-            Ok((length, _addr)) => {
+            Ok((length, addr)) => {
                 if length == 0 {
+                    continue;
+                }
+                // Datagrams from outside the active network are dropped before
+                // they are even parsed, so a filtered-out peer cannot request
+                // streams, send answers, or steer the ladder.
+                if !is_allowed(&read_allowed(&allowed), addr.ip()) {
                     continue;
                 }
                 let Ok(message) = serde_json::from_slice::<Message>(&buffer[..length]) else {

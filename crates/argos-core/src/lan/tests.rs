@@ -7,7 +7,9 @@
 //! real [`dispatch`] over real serialised bytes rather than restating the
 //! mapping next to it.
 
-use super::{dispatch, CursorUpdate, Diagnostics, LanEvent, Message, RosterEntry};
+use super::{dispatch, is_allowed, CursorUpdate, Diagnostics, LanEvent, Message, RosterEntry};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// The id this process would answer to. Messages must be addressed to it.
 const US: &str = "0123456789abcdef";
@@ -21,6 +23,7 @@ fn message(kind: &str) -> Message {
         name: String::new(),
         to: US.to_string(),
         port: 45893,
+        chat_port: 0,
         sharing: false,
         sdp: String::new(),
         loss: 0.0,
@@ -362,3 +365,48 @@ fn a_non_finite_diagnostic_is_rejected_at_parse_time() {
 fn an_unknown_kind_is_ignored_rather_than_misread() {
     assert!(over_the_wire("something-newer").is_none());
 }
+
+/// The chat listener port rides the hello so peers know where to deliver chat.
+/// Losing it would leave every peer looking like a build without chat.
+#[test]
+fn a_hello_carries_the_chat_port() {
+    let mut sent = message("hello");
+    sent.to = String::new();
+    sent.chat_port = 45899;
+    let bytes = serde_json::to_vec(&sent).expect("serialise");
+    let parsed: Message = serde_json::from_slice(&bytes).expect("deserialise");
+    assert_eq!(parsed.chat_port, 45899);
+}
+
+/// A hello from a build that predates chat has no `chat_port` field, and it
+/// must read as "no chat" (0) rather than fail to parse — the beacon is how
+/// old and new builds keep seeing each other.
+#[test]
+fn a_hello_without_chat_port_reads_as_no_chat() {
+    let legacy =
+        br#"{"kind":"hello","id":"aabb","name":"desk","to":"","port":1234,"sharing":false}"#;
+    let parsed: Message = serde_json::from_slice(legacy).expect("legacy hello must parse");
+    assert_eq!(parsed.chat_port, 0);
+}
+
+/// The filter contract: `None` is "no profile" and admits everyone, `Some`
+/// admits only listed IPv4 addresses — including that an empty profile admits
+/// nobody, which is a different state from "no filter".
+#[test]
+fn the_allowed_filter_decides_who_is_a_peer() {
+    let ip = IpAddr::V4(Ipv4Addr::new(26, 0, 0, 7));
+    let other = IpAddr::V4(Ipv4Addr::new(26, 0, 0, 8));
+    let v6 = IpAddr::V6("fd00::1".parse().expect("v6"));
+
+    assert!(is_allowed(&None, ip));
+    assert!(is_allowed(&None, v6));
+
+    let set: HashSet<Ipv4Addr> = [Ipv4Addr::new(26, 0, 0, 7)].into_iter().collect();
+    assert!(is_allowed(&Some(set.clone()), ip));
+    assert!(!is_allowed(&Some(set.clone()), other));
+    // An IPv6 source can never be a set member; it is refused, not unfiltered.
+    assert!(!is_allowed(&Some(set), v6));
+
+    assert!(!is_allowed(&Some(HashSet::new()), ip));
+}
+

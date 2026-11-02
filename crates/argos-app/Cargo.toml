@@ -9,6 +9,31 @@ confy.workspace = true
 serde.workspace = true
 argos-core = { path = "../argos-core" }
 argos-media = { path = "../argos-media" }
+# Chat attachments: decode received images for the panel, encode clipboard
+# images to PNG for sending. Only the formats that can plausibly arrive.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
+# Clipboard images for chat paste. egui-winit already pulls arboard in for
+# text; the direct dependency is for `get_image`.
+arboard = "3.6"
+# GetLocalTime (chat timestamps), GetOpenFileNameW (attach dialog),
+# GetAsyncKeyState (Ctrl+V image paste — egui-winit consumes the key event).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[dev-dependencies]
+# Parsing an old-format config file in the config tests. Already in the tree
+# through confy.
+toml = "0.8"
 
 # Embeds assets/icon.ico into the executable. Windows-only because it drives the
 # SDK's `rc.exe`; the icon it produces is meaningless on any other platform.
