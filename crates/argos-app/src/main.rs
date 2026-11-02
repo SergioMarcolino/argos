@@ -7,7 +7,9 @@
 // stdout, and a GUI subsystem would swallow every result `cargo test` prints.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod chat;
 mod config;
+mod networks;
 mod radmin;
 mod ui;
 

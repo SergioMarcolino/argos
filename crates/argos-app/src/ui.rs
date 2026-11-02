@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 
+use argos_core::chat::{Chat, ChatEvent};
 use argos_core::diagnose::{self, diagnose, Bottleneck};
 use argos_core::metrics::{AudioMetrics, Ema, ReceiverMetrics, SenderMetrics};
 use argos_core::quality::{Controller as QualityController, Decision, Report};
@@ -16,7 +17,9 @@ use argos_media::encode::{
     encode_target, EncodeMsg, EncodeWorker, H264Encoder, KEYFRAME_REQUEST_FLOOR,
 };
 
+use crate::chat::{ChatArgs, ChatPanel};
 use crate::config::{self, AppConfig};
+use crate::networks::Networks;
 
 /// How often the viewer may ask for a keyframe.
 ///
@@ -71,7 +74,7 @@ const CURSOR_SHAPE_INTERVAL: Duration = Duration::from_secs(1);
 /// *live*, is unmissable. Every status color used to live as a bare
 /// `Color32::from_rgb` at its own call site; they live here now, so the app's
 /// voice is one statement rather than thirty-seven.
-mod theme {
+pub(crate) mod theme {
     use eframe::egui::{self, Color32, Visuals};
 
     /// Panel background — a graphite near-black, deliberately not pure black.
@@ -1384,6 +1387,16 @@ pub struct ArgosApp {
     auto_quality: bool,
     lan: Option<lan::Lan>,
     lan_error: Option<String>,
+    /// The active network's IP filter, shared with `lan` and `chat` so a
+    /// profile switch applies to both without restarting either.
+    allowed: lan::Allowed,
+    networks: Networks,
+    chat: Option<Chat>,
+    /// Why chat failed to bind, shown in the panel instead of a working
+    /// composer that would go nowhere.
+    chat_error: Option<String>,
+    chat_panel: ChatPanel,
+    show_chat: bool,
     pending_view: Option<PendingView>,
     /// When the sharer last swept its viewer slots for finished connections.
     last_viewer_sweep: Instant,
@@ -1410,10 +1423,22 @@ impl ArgosApp {
                     .load_texture("argos-icon", image, egui::TextureOptions::LINEAR)
             });
         let config = config::load();
-        let (lan, lan_error) = match lan::Lan::start(config.name.clone()) {
-            Ok(lan) => (Some(lan), None),
+        let allowed: lan::Allowed =
+            std::sync::Arc::new(std::sync::RwLock::new(config.allowed_ips()));
+        // Chat starts before Lan so its ephemeral port can be announced in the
+        // hello. A bind failure must not take discovery down with it — the app
+        // runs on with `chat_port: 0`, which is also what tells peers this
+        // instance has no chat.
+        let (chat, chat_error) = match Chat::start(allowed.clone()) {
+            Ok(chat) => (Some(chat), None),
             Err(error) => (None, Some(error)),
         };
+        let chat_port = chat.as_ref().map(|chat| chat.port()).unwrap_or(0);
+        let (lan, lan_error) =
+            match lan::Lan::start(config.name.clone(), chat_port, allowed.clone()) {
+                Ok(lan) => (Some(lan), None),
+                Err(error) => (None, Some(error)),
+            };
         Self {
             icon,
             name_input: config.name.clone(),
@@ -1443,6 +1468,12 @@ impl ArgosApp {
             auto_quality: true,
             lan,
             lan_error,
+            allowed,
+            networks: Networks::default(),
+            chat,
+            chat_error,
+            chat_panel: ChatPanel::default(),
+            show_chat: false,
             pending_view: None,
             last_viewer_sweep: Instant::now(),
             radmin_exe: crate::radmin::find_exe(),
@@ -1576,6 +1607,25 @@ impl ArgosApp {
                         let (dot, _) =
                             ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                         ui.painter().circle_filled(dot.center(), 3.5, color);
+
+                        // Left of the status in a right-to-left layout. The
+                        // unread count rides the label while the panel is
+                        // hidden, which is the only place new chat can arrive
+                        // unnoticed.
+                        let unread = self.chat_panel.unread();
+                        let chat_label = match unread {
+                            0 => "Chat".to_string(),
+                            n => format!("Chat ({n})"),
+                        };
+                        if title_text_button(ui, &chat_label, theme::TEXT, theme::HOVER)
+                            .on_hover_text("Network chat")
+                            .clicked()
+                        {
+                            self.show_chat = !self.show_chat;
+                            if self.show_chat {
+                                self.chat_panel.clear_unread();
+                            }
+                        }
                     });
                 });
             });
@@ -2264,6 +2314,51 @@ impl ArgosApp {
             Screen::View => self.view.is_some(),
             _ => false,
         }
+    }
+
+    /// Chat's share of the event pump: received messages append to the panel,
+    /// delivery failures annotate the entry that went out. A message that
+    /// arrives while the window is unfocused asks the OS for attention,
+    /// because nothing else on screen announces it.
+    fn poll_chat_events(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(chat) = self.chat.as_ref() {
+            while let Some(event) = chat.try_event() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            match event {
+                ChatEvent::Received { message, .. } => {
+                    self.chat_panel.push_received(message, self.show_chat);
+                    if !self.show_chat && !ctx.input(|i| i.viewport().focused).unwrap_or(false) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Informational,
+                        ));
+                    }
+                }
+                ChatEvent::SendFailed {
+                    msg_id, to_name, ..
+                } => {
+                    self.chat_panel.mark_failed(&msg_id, &to_name);
+                }
+            }
+        }
+    }
+
+    /// The chat sidebar, drawn only while toggled on. Recipients are the
+    /// peers the active network currently admits that have chat — a peer on
+    /// an old build advertises `chat_port: 0` and is skipped.
+    fn show_chat_panel(&mut self, ctx: &egui::Context) {
+        let peers = self.lan.as_ref().map(|lan| lan.peers()).unwrap_or_default();
+        let args = ChatArgs {
+            chat: self.chat.as_ref(),
+            peers: &peers,
+            my_id: self.lan.as_ref().map(|lan| lan.id()).unwrap_or(""),
+            my_name: &self.config.name,
+            error: self.chat_error.as_deref(),
+        };
+        self.chat_panel.show(ctx, &args);
     }
 
     fn poll_lan_events(&mut self, ctx: &egui::Context) {
@@ -3303,6 +3398,23 @@ impl ArgosApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Which Radmin network this PC is participating in. Disabled
+                // while a stream is live because it decides who may connect.
+                let busy = self.share.is_some() || self.view.is_some() || self.live;
+                if let Some(name) = self
+                    .networks
+                    .picker(ui, &mut self.config, &self.allowed, busy)
+                {
+                    self.chat_panel.system_line(format!("— Network: {name} —"));
+                }
+                if self.config.allowed_ips().is_some_and(|set| set.is_empty()) {
+                    ui.label(
+                        RichText::new("No one in this network yet — add IPs in Manage networks")
+                            .weak(),
+                    );
+                }
+                ui.add_space(theme::SPACE_XS);
+
                 let people = match peers.len() {
                     0 => "People".to_string(),
                     n => format!("People ({n})"),
@@ -4614,6 +4726,7 @@ impl eframe::App for ArgosApp {
         }
         theme::apply(ctx);
         self.poll_lan_events(ctx);
+        self.poll_chat_events(ctx);
         // A window close tears the process down without any other teardown path,
         // so the viewers are told here, once.
         if self.share.is_some()
@@ -4665,11 +4778,23 @@ impl eframe::App for ArgosApp {
             self.metrics_window(ctx);
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        if self.lan.is_some() && self.capture.is_none() && self.view.is_none() {
+        if (self.lan.is_some() || self.chat.is_some())
+            && self.capture.is_none()
+            && self.view.is_none()
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         if self.show_settings && !fullscreen {
             self.settings_window(ctx);
+        }
+        // The chat panel and the networks window are part of the normal
+        // chrome; fullscreen video owns the whole window.
+        if self.show_chat && !fullscreen {
+            self.show_chat_panel(ctx);
+        }
+        if !fullscreen {
+            self.networks
+                .window(ctx, &mut self.config, &self.allowed, self.lan.as_ref());
         }
     }
 }
