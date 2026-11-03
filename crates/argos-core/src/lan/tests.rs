@@ -11,6 +11,8 @@ use super::{dispatch, is_allowed, CursorUpdate, Diagnostics, LanEvent, Message, 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 
+use super::network_tag;
+
 /// The id this process would answer to. Messages must be addressed to it.
 const US: &str = "0123456789abcdef";
 /// The peer that sent the message.
@@ -28,6 +30,7 @@ fn message(kind: &str) -> Message {
         sdp: String::new(),
         loss: 0.0,
         fps: 0.0,
+        radmin_networks: Vec::new(),
         diag: Diagnostics::default(),
         roster: Vec::new(),
         source_fps: 0,
@@ -500,4 +503,29 @@ fn two_lans_discover_each_other_and_chat() {
         assert!(Instant::now() < deadline, "chat never arrived");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The tag is the whole privacy contract: stable enough for two peers to
+/// compare, opaque enough that a packet capture cannot reveal the name.
+#[test]
+fn network_tags_are_deterministic_and_distinct() {
+    let a = network_tag("friday-squad");
+    assert_eq!(a, network_tag("friday-squad"));
+    assert_ne!(a, network_tag("game-night"));
+    assert_eq!(a.len(), 16);
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    // And it does not leak the name: no substring of it survives.
+    assert!(!a.contains("friday"));
+}
+
+/// A hello with no `radmin_networks` key — an old build — parses to an empty
+/// list; a new one carries the tags through.
+#[test]
+fn the_hello_carries_radmin_tags_and_defaults_to_empty() {
+    let bare = r#"{"kind":"hello","id":"x","port":1}"#;
+    let message: Message = serde_json::from_str(bare).unwrap();
+    assert!(message.radmin_networks.is_empty());
+    let with = r#"{"kind":"hello","id":"x","port":1,"radmin_networks":["a1b2"]}"#;
+    let message: Message = serde_json::from_str(with).unwrap();
+    assert_eq!(message.radmin_networks, vec!["a1b2".to_string()]);
 }

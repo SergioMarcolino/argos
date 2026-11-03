@@ -17,7 +17,8 @@ use image::ImageEncoder;
 use argos_core::chat::{Chat, ChatKind, ChatMessage, MAX_ATTACHMENT_BYTES, MAX_TEXT_CHARS};
 use argos_core::lan::LanPeer;
 
-use crate::ui::theme;
+use crate::theme;
+use crate::widgets;
 
 /// How many entries the history holds before the oldest are dropped, textures
 /// included — a long session cannot be allowed to grow without bound.
@@ -48,6 +49,8 @@ struct Entry {
     failed: Vec<String>,
     /// Where an attachment was saved, once it has been.
     saved: Option<PathBuf>,
+    /// Minutes on the wall clock, for message grouping.
+    stamp_min: u64,
 }
 
 enum Content {
@@ -87,6 +90,8 @@ type DecodeResult = (String, Result<egui::ColorImage, String>);
 /// Everything the panel needs from the app, passed in each frame because the
 /// panel is a view over state it does not own.
 pub struct ChatArgs<'a> {
+    /// The active network's name ("" = all) — the composer's hint.
+    pub network: &'a str,
     pub chat: Option<&'a Chat>,
     /// The LAN peers messages fan out to — already network-filtered.
     pub peers: &'a [LanPeer],
@@ -153,6 +158,7 @@ impl ChatPanel {
             mine: false,
             sender: sanitize_sender(&message.from_name),
             time: now_hhmm(),
+            stamp_min: now_minutes(),
             content,
             failed: Vec::new(),
             saved: None,
@@ -174,6 +180,7 @@ impl ChatPanel {
             mine: false,
             sender: String::new(),
             time: String::new(),
+            stamp_min: now_minutes(),
             content: Content::System(text),
             failed: Vec::new(),
             saved: None,
@@ -219,7 +226,32 @@ impl ChatPanel {
             .default_width(320.0)
             .width_range(220.0..=600.0)
             .show(ctx, |ui| {
-                ui.label(RichText::new("Chat").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "# {}",
+                            if args.network.is_empty() {
+                                "all"
+                            } else {
+                                args.network
+                            }
+                        ))
+                        .strong()
+                        .size(theme::TEXT_M + 2.0),
+                    );
+                });
+                ui.add_space(6.0);
+                let (line, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    line,
+                    egui::CornerRadius::ZERO,
+                    theme::BORDER.gamma_multiply(0.4),
+                );
                 if let Some(error) = args.error {
                     ui.label(RichText::new(format!("Chat unavailable: {error}")).color(theme::ERR));
                 }
@@ -230,8 +262,25 @@ impl ChatPanel {
                         if self.entries.is_empty() {
                             ui.label(RichText::new("No messages yet.").weak());
                         }
+                        let mut prev: Option<(String, u64)> = None;
                         for entry in &mut self.entries {
-                            Self::entry(ui, &mut self.image_window, entry);
+                            let system = matches!(entry.content, Content::System(_));
+                            let key = if entry.mine {
+                                String::new()
+                            } else {
+                                entry.sender.clone()
+                            };
+                            let grouped = !system
+                                && starts_group(
+                                    prev.as_ref().map(|(s, m)| (s.as_str(), *m)),
+                                    (&key, entry.stamp_min),
+                                );
+                            Self::entry(ui, &mut self.image_window, entry, !grouped);
+                            prev = if system {
+                                None
+                            } else {
+                                Some((key, entry.stamp_min))
+                            };
                         }
                     });
                 self.composer(ui, args);
@@ -378,8 +427,15 @@ impl ChatPanel {
         self.picked.get_or_insert_with(channel).0.clone()
     }
 
-    /// One entry row: who and when, then the content.
-    fn entry(ui: &mut egui::Ui, image_window: &mut Option<String>, entry: &mut Entry) {
+    /// One entry row: header (avatar, who, when) when `header` is set — a
+    /// follow-up line in the same group skips it and keeps its content
+    /// aligned under the group's first message.
+    fn entry(
+        ui: &mut egui::Ui,
+        image_window: &mut Option<String>,
+        entry: &mut Entry,
+        header: bool,
+    ) {
         if let Content::System(text) = &entry.content {
             ui.label(RichText::new(text).weak().italics());
             return;
@@ -389,59 +445,77 @@ impl ChatPanel {
         } else {
             entry.sender.clone()
         };
-        ui.label(RichText::new(format!("{sender}  {}", entry.time)).weak());
-        match &mut entry.content {
-            Content::Text(text) => {
-                ui.add(egui::Label::new(text.as_str()).selectable(true).wrap());
-            }
-            Content::Image {
-                name,
-                data,
-                evicted,
-                texture,
-                decoding,
-            } => {
-                ui.label(RichText::new(name.as_str()).weak());
-                match texture {
-                    Some(texture) => {
-                        let image = egui::Image::new(&*texture).max_size(THUMB_MAX);
-                        let response = ui.add(image);
-                        if response.interact(egui::Sense::click()).clicked() {
-                            *image_window = Some(entry.msg_id.clone());
+        if header {
+            ui.horizontal(|ui| {
+                widgets::avatar(ui, &sender, &entry.sender, 36.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let name_color = if entry.mine {
+                            theme::ACCENT
+                        } else {
+                            theme::TEXT
+                        };
+                        ui.label(RichText::new(&sender).strong().color(name_color));
+                        ui.label(RichText::new(&entry.time).weak().size(theme::TEXT_S));
+                    });
+                });
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(44.0);
+            ui.vertical(|ui| match &mut entry.content {
+                Content::Text(text) => {
+                    ui.add(egui::Label::new(text.as_str()).selectable(true).wrap());
+                }
+                Content::Image {
+                    name,
+                    data,
+                    evicted,
+                    texture,
+                    decoding,
+                } => {
+                    ui.label(RichText::new(name.as_str()).weak());
+                    match texture {
+                        Some(texture) => {
+                            let image = egui::Image::new(&*texture).max_size(THUMB_MAX);
+                            let response = ui.add(image);
+                            if response.interact(egui::Sense::click()).clicked() {
+                                *image_window = Some(entry.msg_id.clone());
+                            }
+                        }
+                        None => {
+                            ui.label(
+                                RichText::new(if *decoding {
+                                    "Decoding…"
+                                } else {
+                                    "Could not decode this image"
+                                })
+                                .weak(),
+                            );
                         }
                     }
-                    None => {
-                        ui.label(
-                            RichText::new(if *decoding {
-                                "Decoding…"
-                            } else {
-                                "Could not decode this image"
-                            })
-                            .weak(),
-                        );
+                    if *evicted {
+                        ui.label(RichText::new("No longer in memory").weak());
+                    } else {
+                        Self::save_row(ui, data, name, &mut entry.saved);
                     }
                 }
-                if *evicted {
-                    ui.label(RichText::new("No longer in memory").weak());
-                } else {
-                    Self::save_row(ui, data, name, &mut entry.saved);
+                Content::File {
+                    name,
+                    data,
+                    size,
+                    evicted,
+                } => {
+                    ui.label(format!("{}  ({})", name, human_size(*size)));
+                    if *evicted {
+                        ui.label(RichText::new("No longer in memory").weak());
+                    } else {
+                        Self::save_row(ui, data, name, &mut entry.saved);
+                    }
                 }
-            }
-            Content::File {
-                name,
-                data,
-                size,
-                evicted,
-            } => {
-                ui.label(format!("{}  ({})", name, human_size(*size)));
-                if *evicted {
-                    ui.label(RichText::new("No longer in memory").weak());
-                } else {
-                    Self::save_row(ui, data, name, &mut entry.saved);
-                }
-            }
-            Content::System(_) => {}
-        }
+                Content::System(_) => {}
+            });
+        });
         for name in &entry.failed {
             ui.label(RichText::new(format!("not delivered to {name}")).color(theme::ERR));
         }
@@ -517,30 +591,53 @@ impl ChatPanel {
             ui.label(RichText::new(error).color(theme::ERR));
         }
         ui.add_enabled_ui(can_send, |ui| {
-            ui.horizontal(|ui| {
-                if ui.small_button("Attach…").clicked() {
-                    self.open_dialog();
-                }
-                // Enter sends; Shift+Enter is a newline. The key must be eaten
-                // before the TextEdit sees it, or the send also inserts the
-                // newline mid-message — and the press only counts when the
-                // composer has focus, checked through its stable id.
-                let edit_id = ui.id().with("composer");
-                let send_pressed = ui.memory(|m| m.has_focus(edit_id))
-                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-                let edit = egui::TextEdit::multiline(&mut self.input)
-                    .id(edit_id)
-                    .hint_text("Message — Enter to send, Shift+Enter for a new line")
-                    .desired_rows(2);
-                let response = ui.add(edit);
-                if send_pressed {
-                    self.send_text(args);
-                    response.request_focus();
-                }
-                if ui.button("Send").clicked() {
-                    self.send_text(args);
-                }
-            });
+            egui::Frame::NONE
+                .fill(theme::INSET)
+                .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("+")
+                                    .corner_radius(egui::CornerRadius::same(12))
+                                    .min_size(egui::vec2(24.0, 24.0)),
+                            )
+                            .on_hover_text("Attach a file")
+                            .clicked()
+                        {
+                            self.open_dialog();
+                        }
+                        // Enter sends; Shift+Enter is a newline. The key must be eaten
+                        // before the TextEdit sees it, or the send also inserts the
+                        // newline mid-message — and the press only counts when the
+                        // composer has focus, checked through its stable id.
+                        let edit_id = ui.id().with("composer");
+                        let send_pressed = ui.memory(|m| m.has_focus(edit_id))
+                            && ui.input_mut(|i| {
+                                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                            });
+                        let edit = egui::TextEdit::multiline(&mut self.input)
+                            .id(edit_id)
+                            .hint_text(format!(
+                                "Message #{}",
+                                if args.network.is_empty() {
+                                    "all"
+                                } else {
+                                    args.network
+                                }
+                            ))
+                            .desired_rows(2);
+                        let response = ui.add(edit);
+                        if send_pressed {
+                            self.send_text(args);
+                            response.request_focus();
+                        }
+                        if ui.button("Send").clicked() {
+                            self.send_text(args);
+                        }
+                    });
+                });
         });
     }
 
@@ -619,6 +716,7 @@ impl ChatPanel {
             mine: true,
             sender: "You".to_string(),
             time: now_hhmm(),
+            stamp_min: now_minutes(),
             content,
             failed: Vec::new(),
             saved: None,
@@ -691,6 +789,23 @@ fn sanitize_sender(name: &str) -> String {
         "Someone".to_string()
     } else {
         clean.chars().take(64).collect()
+    }
+}
+
+/// Minutes on the wall clock, for grouping — one entry's `stamp_min`.
+fn now_minutes() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0)
+}
+
+/// Whether `cur` continues the group `prev` started: same sender, no more
+/// than five minutes apart. System lines and a new day break the group.
+fn starts_group(prev: Option<(&str, u64)>, cur: (&str, u64)) -> bool {
+    match prev {
+        Some((sender, stamp)) => sender == cur.0 && cur.1.saturating_sub(stamp) < 5,
+        None => false,
     }
 }
 
@@ -936,5 +1051,18 @@ mod tests {
         assert_eq!(next_unread(0, false), 1);
         assert_eq!(next_unread(3, false), 4);
         assert_eq!(next_unread(3, true), 3);
+    }
+    /// Grouping is sender + recency: five minutes splits, a system line
+    /// (represented by the caller resetting `prev`) splits, a different
+    /// sender splits.
+    #[test]
+    fn consecutive_messages_group_within_five_minutes() {
+        assert!(starts_group(Some(("ana", 100)), ("ana", 104)));
+        assert!(!starts_group(Some(("ana", 100)), ("ana", 105)));
+        assert!(!starts_group(Some(("ana", 100)), ("bob", 101)));
+        assert!(!starts_group(None, ("ana", 100)));
+        // A backwards clock saturates to zero elapsed — same minute, so it
+        // still groups rather than splitting a streak over a skewed stamp.
+        assert!(starts_group(Some(("ana", 100)), ("ana", 99)));
     }
 }

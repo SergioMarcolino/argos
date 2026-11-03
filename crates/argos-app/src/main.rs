@@ -12,7 +12,10 @@ mod config;
 mod networks;
 mod radmin;
 mod source;
+mod splash;
+mod theme;
 mod ui;
+mod widgets;
 
 use eframe::egui;
 

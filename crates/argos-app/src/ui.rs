@@ -21,6 +21,9 @@ use crate::chat::{ChatArgs, ChatPanel};
 use crate::config::{self, AppConfig};
 use crate::networks::Networks;
 use crate::source::SourcePicker;
+use crate::splash::Splash;
+use crate::theme;
+use crate::widgets;
 
 /// How often the viewer may ask for a keyframe.
 ///
@@ -75,155 +78,6 @@ const CURSOR_SHAPE_INTERVAL: Duration = Duration::from_secs(1);
 /// *live*, is unmissable. Every status color used to live as a bare
 /// `Color32::from_rgb` at its own call site; they live here now, so the app's
 /// voice is one statement rather than thirty-seven.
-pub(crate) mod theme {
-    use eframe::egui::{self, Color32, Visuals};
-
-    /// Panel background — a graphite near-black, deliberately not pure black.
-    pub const BG: Color32 = Color32::from_rgb(20, 22, 25);
-    /// Floating or emphasised panels: windows, the sidebar.
-    pub const SURFACE: Color32 = Color32::from_rgb(28, 31, 36);
-    /// Hairlines between sections of a dark surface.
-    pub const BORDER: Color32 = Color32::from_rgb(42, 46, 53);
-    /// Primary text. Contrast on `BG`: ~15:1.
-    pub const TEXT: Color32 = Color32::from_rgb(232, 234, 237);
-    /// Secondary text: anything that must hold still while status changes.
-    /// Contrast on `BG`: ~6.5:1.
-    pub const MUTED: Color32 = Color32::from_rgb(150, 156, 166);
-    /// The brand — a watch blue, this app's own identity.
-    pub const ACCENT: Color32 = Color32::from_rgb(160, 190, 255);
-    /// A peer is live and watching.
-    pub const OK: Color32 = Color32::from_rgb(150, 220, 150);
-    /// Something is being waited on.
-    pub const WARN: Color32 = Color32::from_rgb(220, 200, 120);
-    /// Something is wrong. Held to roughly the weight of the other two, because
-    /// a failure being the quietest thing on a dark screen is its own bug.
-    /// Contrast on `BG`: ~7.2:1.
-    pub const ERR: Color32 = Color32::from_rgb(235, 135, 135);
-
-    /// The fill of a resting control: buttons, selectable rows.
-    pub const RAISED: Color32 = Color32::from_rgb(35, 38, 44);
-    /// The fill a control wears while the pointer is over it. Deliberately one
-    /// visible step above both `SURFACE` and `RAISED`: a hover nobody notices is
-    /// a hover that does not exist, and the pointer has no other way to say "this
-    /// responds".
-    pub const HOVER: Color32 = Color32::from_rgb(66, 73, 84);
-    /// The fill a control wears while held. Above `HOVER`, so a press reads as
-    /// going further in rather than bouncing back out.
-    pub const PRESSED: Color32 = Color32::from_rgb(84, 92, 105);
-    /// Sunken fields egui draws itself, chiefly text edits.
-    pub const INSET: Color32 = Color32::from_rgb(13, 14, 16);
-    /// The faintest surface egui draws, for alternating rows.
-    pub const FAINT: Color32 = Color32::from_rgb(23, 26, 30);
-
-    /// Spacing scale, in points. Reach for the nearest step rather than a bare
-    /// number so the rhythm survives an edit.
-    pub const SPACE_XS: f32 = 4.0;
-    pub const SPACE_S: f32 = 8.0;
-    pub const SPACE_M: f32 = 12.0;
-
-    /// Corner radius for a small control — a hover fill, a chip. egui's own unit
-    /// is whole pixels, so these are `u8` rather than the `f32` of the scale.
-    pub const RADIUS_S: u8 = 4;
-    /// Corner radius for a floating panel or a framed picture.
-    pub const RADIUS: u8 = 6;
-
-    /// Type scale, in points: caption, body, and the one loud line. Installed
-    /// into egui as its text styles, so a screen asks for "heading" or "body"
-    /// rather than passing a bare size to a call site.
-    ///
-    /// These are the knob to turn if the UI reads too big or too small: Plex Sans
-    /// carries a taller x-height than the face egui ships, so it looks larger at
-    /// the same size — `TEXT_M` alone shifts every ordinary label.
-    pub const TEXT_S: f32 = 12.0;
-    pub const TEXT_M: f32 = 13.0;
-    pub const TEXT_L: f32 = 17.0;
-
-    /// Height of the custom title bar, close to a native Windows caption.
-    pub const TITLE_BAR_HEIGHT: f32 = 36.0;
-    /// Widest a column of text may get, so prose does not stretch across a
-    /// maximised window. Screens that show video ignore it on purpose.
-    pub const CONTENT_MAX_WIDTH: f32 = 720.0;
-
-    /// The sidebar's width, and the range a drag may take it to. The People list
-    /// grows with the names in it, so the panel is resizable — but not unbounded:
-    /// a sidebar that can swallow the window is worse than one that cannot move.
-    pub const SIDEBAR_WIDTH: f32 = 240.0;
-    pub const SIDEBAR_MIN_WIDTH: f32 = 170.0;
-    pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;
-
-    /// Installs the palette and the type scale into egui's global style.
-    ///
-    /// Text colours still follow egui's dark defaults — this moves surfaces,
-    /// status, and sizes — so `.weak()` and friends keep their meaning.
-    pub fn apply(ctx: &egui::Context) {
-        let mut visuals = Visuals::dark();
-        visuals.panel_fill = BG;
-        visuals.window_fill = SURFACE;
-        visuals.extreme_bg_color = INSET;
-        visuals.faint_bg_color = FAINT;
-        visuals.widgets.inactive.bg_fill = RAISED;
-        visuals.widgets.inactive.weak_bg_fill = RAISED;
-        visuals.widgets.hovered.bg_fill = HOVER;
-        visuals.widgets.active.bg_fill = PRESSED;
-        // Any hairline egui draws — separators, widget outlines — is the palette's
-        // BORDER, not the default dark-theme grey.
-        visuals.widgets.noninteractive.bg_stroke.color = BORDER;
-        // Text is the one thing that must not blend into the graphite. egui
-        // colours non-interactive labels from `fg_stroke`, and the dark-theme
-        // default is grey-on-black: brighten it explicitly, and give the weak()
-        // tier a real colour rather than a default that was too dim to read.
-        visuals.widgets.noninteractive.fg_stroke.color = TEXT;
-        visuals.weak_text_color = Some(MUTED);
-        visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-        visuals.hyperlink_color = ACCENT;
-
-        // The sizes, installed the same way as the colours so that "body" and
-        // "heading" are names rather than numbers scattered through the file. The
-        // monospace face is reserved for readouts: fixed digit widths stop the
-        // live numbers from reflowing every time they tick.
-        let mut style = (*ctx.style()).clone();
-        style.text_styles = [
-            (egui::TextStyle::Heading, egui::FontId::proportional(TEXT_L)),
-            (egui::TextStyle::Body, egui::FontId::proportional(TEXT_M)),
-            (egui::TextStyle::Button, egui::FontId::proportional(TEXT_M)),
-            (egui::TextStyle::Small, egui::FontId::proportional(TEXT_S)),
-            (egui::TextStyle::Monospace, egui::FontId::monospace(TEXT_M)),
-        ]
-        .into();
-        style.visuals = visuals;
-        ctx.set_style(style);
-    }
-
-    /// The app's proportional face: IBM Plex Sans, embedded so the type is
-    /// Argos's own rather than whatever egui ships. This is the variable font,
-    /// resolved at its default instance (Regular); its licence sits beside it as
-    /// `assets/IBMPlexSans-OFL.txt`.
-    const PROPORTIONAL: &[u8] = include_bytes!("../assets/IBMPlexSans.ttf");
-
-    /// Installs the font families.
-    ///
-    /// Separate from `apply` because it must run *once*: `set_fonts` rebuilds the
-    /// glyph atlas, and rebuilding it every frame would cost more than the type
-    /// is worth. So this is called from `ArgosApp::new`, and `apply` stays the
-    /// per-frame part.
-    pub fn install_fonts(ctx: &egui::Context) {
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "plex-sans".to_owned(),
-            egui::FontData::from_static(PROPORTIONAL).into(),
-        );
-        // Front of the proportional family, so every non-monospace label is Plex.
-        // The bundled faces stay behind it as fallbacks for the glyphs it does
-        // not carry — emoji, arrows and the like.
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "plex-sans".to_owned());
-        ctx.set_fonts(fonts);
-    }
-}
-
 #[derive(Clone, PartialEq, Eq)]
 enum Screen {
     Home,
@@ -1374,6 +1228,12 @@ pub struct ArgosApp {
     /// Whether the "stream ended" notice has already gone out for this share, so
     /// a window close racing several `update` calls does not repeat it.
     stop_sent: bool,
+    splash: Splash,
+    /// Last time the shared `Allowed` was rebuilt from rooms + live peers.
+    allowed_tick: std::time::Instant,
+    /// The central screen last frame + when it changed, for the fade-in.
+    screen_fade_key: u8,
+    screen_fade_at: std::time::Instant,
     view: Option<ViewSession>,
     view_error: Option<String>,
     /// Why the last restart attempt did not happen. Its own slot because
@@ -1461,6 +1321,10 @@ impl ArgosApp {
             live: false,
             cursor_sent: None,
             stop_sent: false,
+            splash: Splash::new(),
+            allowed_tick: std::time::Instant::now(),
+            screen_fade_key: 0,
+            screen_fade_at: std::time::Instant::now(),
             view: None,
             view_error: None,
             restart_error: None,
@@ -1511,7 +1375,7 @@ impl ArgosApp {
 
         egui::TopBottomPanel::top("title_bar")
             .exact_height(theme::TITLE_BAR_HEIGHT)
-            .frame(egui::Frame::NONE.fill(theme::SURFACE))
+            .frame(egui::Frame::NONE.fill(theme::RAIL))
             .show(ctx, |ui| {
                 let mut note = |rect: egui::Rect| {
                     controls = Some(controls.map_or(rect, |prev| prev.union(rect)));
@@ -1538,8 +1402,11 @@ impl ArgosApp {
                 }
 
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(theme::SPACE_M);
-                    if title_text_button(ui, "Argos", theme::TEXT, theme::HOVER)
+                    ui.add_space(theme::SPACE_L);
+                    if let Some(icon) = &self.icon {
+                        ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(18.0, 18.0)));
+                    }
+                    if title_text_button(ui, "Argos", theme::MUTED, theme::HOVER)
                         .on_hover_text("Home")
                         .clicked()
                     {
@@ -1594,7 +1461,9 @@ impl ArgosApp {
                                 ui.close();
                             }
                             ui.separator();
-                            ui.label(RichText::new("Argos 1.4.2").weak());
+                            ui.label(
+                                RichText::new(concat!("Argos ", env!("CARGO_PKG_VERSION"))).weak(),
+                            );
                         });
                         note(menu.response.rect);
 
@@ -1651,25 +1520,123 @@ impl ArgosApp {
 
     fn side_bar(&mut self, ctx: &egui::Context) {
         let panel_id = egui::Id::new("side_panel");
+        let mut collapse = false;
+        let open = !self.config.sidebar_collapsed;
+        let peer_count = self.lan.as_ref().map(|lan| lan.peers().len()).unwrap_or(0);
         egui::SidePanel::left(panel_id)
+            .frame(egui::Frame::NONE.fill(theme::SIDEBAR))
             .resizable(true)
             .default_width(theme::SIDEBAR_WIDTH)
             .width_range(theme::SIDEBAR_MIN_WIDTH..=theme::SIDEBAR_MAX_WIDTH)
-            .show(ctx, |ui| {
+            .show_animated(ctx, open, |ui| {
                 ui.add_space(theme::SPACE_XS);
+                // 56 px header: room name + online count, "«" and "⚙" on the
+                // right, then a soft rule instead of the hard separator.
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.set_min_height(theme::CHANNEL_HEADER);
+                    ui.vertical(|ui| {
+                        let title = if self.config.active_network.is_empty() {
+                            "All networks".to_string()
+                        } else {
+                            self.config.active_network.clone()
+                        };
+                        // Truncate to the space left of the buttons; hover
+                        // shows the full name.
+                        let width = ui.available_width() - 96.0;
+                        ui.add_sized(
+                            egui::vec2(width, 20.0),
+                            egui::Label::new(
+                                RichText::new(title).strong().size(theme::TEXT_M + 2.0),
+                            )
+                            .truncate(),
+                        );
+                        let radmin_room = self
+                            .config
+                            .networks
+                            .iter()
+                            .find(|p| p.name == self.config.active_network)
+                            .is_some_and(|p| p.radmin);
+                        let sub = if radmin_room {
+                            format!("{peer_count} online · Radmin")
+                        } else {
+                            format!("{peer_count} online")
+                        };
+                        ui.label(RichText::new(sub).weak().size(theme::TEXT_S));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("«").on_hover_text("Collapse sidebar").clicked() {
+                            collapse = true;
+                        }
+                        if ui.button("⚙").on_hover_text("Manage networks").clicked() {
+                            self.networks.open_manager();
+                        }
+                        ui.add_space(14.0);
+                    });
+                });
+                ui.add_space(10.0);
+                let (line, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().rect_filled(
+                    line,
+                    egui::CornerRadius::ZERO,
+                    theme::BORDER.gamma_multiply(0.4),
+                );
+                ui.add_space(4.0);
                 let selected = self.screen == Screen::Share;
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 0.0],
-                        egui::Button::selectable(selected, RichText::new("Share").strong()),
-                    )
-                    .clicked()
-                {
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 44.0),
+                    egui::Sense::click(),
+                );
+                Self::paint_row_fill(ui, ctx, resp.id, &resp, selected);
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(8.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    "▶  Share your screen",
+                    egui::FontId::proportional(theme::TEXT_M),
+                    theme::TEXT,
+                );
+                if resp.clicked() {
                     self.screen = Screen::Share;
                 }
-                ui.separator();
+                ui.add_space(8.0);
                 self.sidebar(ui);
+                egui::TopBottomPanel::bottom("user_panel")
+                    .exact_height(theme::USER_PANEL_HEIGHT)
+                    .frame(egui::Frame::NONE.fill(theme::USER_PANEL))
+                    .show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_space(theme::SPACE_S);
+                            let name = self.profile_label();
+                            widgets::avatar(ui, &name, &name, 32.0);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&name));
+                                let ip = self
+                                    .lan
+                                    .as_ref()
+                                    .and_then(|lan| lan.local_address())
+                                    .map(|ip| format!("This PC: {ip}"))
+                                    .unwrap_or_else(|| "No VPN address".to_string());
+                                ui.label(RichText::new(ip).weak().size(theme::TEXT_S));
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("⚙").on_hover_text("Profile").clicked() {
+                                        self.name_input.clone_from(&self.config.name);
+                                        self.show_settings = true;
+                                    }
+                                },
+                            );
+                        });
+                    });
             });
+        if collapse {
+            self.config.sidebar_collapsed = true;
+            let _ = config::save(&self.config);
+        }
 
         // Double-clicking the divider snaps back to the default width. The
         // resize handle is drag-only, so a double-click never reaches it as a
@@ -2343,6 +2310,7 @@ impl ArgosApp {
     fn show_chat_panel(&mut self, ctx: &egui::Context) {
         let peers = self.lan.as_ref().map(|lan| lan.peers()).unwrap_or_default();
         let args = ChatArgs {
+            network: &self.config.active_network,
             chat: self.chat.as_ref(),
             peers: &peers,
             my_id: self.lan.as_ref().map(|lan| lan.id()).unwrap_or(""),
@@ -2955,11 +2923,27 @@ impl ArgosApp {
         // Two independent reasons to ask, because they fail differently:
         // sequence gaps (loss), and an intact stream the decoder refuses to
         // decode because it is waiting for an intra frame (starved).
+        // Drive the reorder buffer's deadlines so a dying frame reports
+        // Broken promptly instead of hanging the stream.
+        if let Ok(mut sink) = view.sink.lock() {
+            sink.poll_deadline();
+        }
+        // A Broken frame needs a keyframe NOW — faster than the starvation
+        // interval; the sharer-side floor still applies.
+        let broken = view
+            .metrics
+            .broken
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
         let connected = view.viewer.is_connected();
-        let needs_keyframe = view.quality.loss >= LOSS_BURST || view.quality.starved;
+        let needs_keyframe = broken || view.quality.loss >= LOSS_BURST || view.quality.starved;
+        let interval = if broken {
+            Duration::ZERO
+        } else {
+            KEYFRAME_REQUEST_INTERVAL
+        };
         if connected
             && needs_keyframe
-            && now.duration_since(view.quality.last_keyframe_request) >= KEYFRAME_REQUEST_INTERVAL
+            && now.duration_since(view.quality.last_keyframe_request) >= interval
         {
             view.quality.last_keyframe_request = now;
             view.quality.requested_at_loss = view.quality.loss;
@@ -3029,47 +3013,72 @@ impl ArgosApp {
         // Center the picture in whatever space is left. Fullscreen on an
         // ultrawide (or any ratio that does not match the source) leaves bars
         // on two sides; drawing top-left would push the picture into a corner.
+        // The offset is clamped at zero: when the picture is taller or wider
+        // than the space, a negative offset would paint it *over* the controls
+        // above — the surrounding scroll area is what handles a short window.
         let avail = ui.available_size();
-        let offset = (avail - size) * 0.5;
+        let offset = ((avail - size) * 0.5).max(egui::vec2(0.0, 0.0));
         let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
-        let pos = rect.min + offset;
+        let pic = egui::Rect::from_min_size(rect.min + offset, size);
         ui.painter().image(
             preview.texture.id(),
-            egui::Rect::from_min_size(pos, size),
+            pic,
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
+        ui.painter().rect_stroke(
+            pic,
+            egui::CornerRadius::same(theme::RADIUS),
+            egui::Stroke::new(1.0_f32, theme::BORDER),
+            egui::StrokeKind::Outside,
+        );
     }
 
+    /// The VPN status, only when there is something to act on: no address
+    /// means friends cannot find this PC. A soft card rather than a naked
+    /// warning, so it reads as a status instead of an alarm.
     fn network_status(&mut self, ui: &mut egui::Ui) {
-        match self.lan.as_ref().and_then(|lan| lan.local_address()) {
-            Some(ip) => {
-                ui.label(RichText::new(format!("This PC on your network: {ip}")).weak());
-            }
-            None => {
+        if self
+            .lan
+            .as_ref()
+            .and_then(|lan| lan.local_address())
+            .is_some()
+        {
+            return;
+        }
+        let mut launch = false;
+        egui::Frame::NONE
+            .fill(theme::FAINT)
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
                 ui.label(
                     RichText::new("Radmin VPN not detected — friends can't find this PC yet.")
-                        .color(theme::WARN),
+                        .color(theme::WARN)
+                        .size(theme::TEXT_S),
                 );
                 if self.radmin_exe.is_some() {
                     if ui.button("Launch Radmin VPN").clicked() {
-                        self.launch_radmin();
+                        launch = true;
                     }
                 } else {
                     ui.label(
-                        RichText::new("Install Radmin VPN to share with friends online.").weak(),
+                        RichText::new("Install Radmin VPN to share with friends online.")
+                            .weak()
+                            .size(theme::TEXT_S),
                     );
                 }
                 if let Some(error) = &self.radmin_error {
                     ui.label(RichText::new(error).color(theme::ERR));
                 }
-            }
+            });
+        if launch {
+            self.launch_radmin();
         }
         if let Some(error) = &self.lan_error {
             ui.label(RichText::new(format!("Network discovery off: {error}")).weak());
         }
     }
-
     fn launch_radmin(&mut self) {
         match crate::radmin::launch() {
             Ok(()) => self.radmin_error = None,
@@ -3148,11 +3157,50 @@ impl ArgosApp {
             if ui.button("Stop streaming").clicked() {
                 do_stop_live = true;
             }
-        } else if ui.button("Go Live").clicked() {
+        } else if widgets::primary_button(ui, "Go Live").clicked() {
             do_go_live = true;
         }
 
-        self.source.picker(ui, self.capture.is_some());
+        // The combo is never locked: picking a source mid-stream hot-swaps
+        // the capture onto a fresh session for the new selection.
+        if self.source.picker(ui) {
+            match crate::source::swap_action(self.live, self.share.is_some(), self.preview_active) {
+                crate::source::SwapAction::Swap => {
+                    if let Some(source) = self.source.source() {
+                        let mut session = CaptureSession::new();
+                        session.set_interval(self.frame_interval());
+                        match session.start(&source) {
+                            Ok(()) => {
+                                let active =
+                                    self.preview_active || self.live || self.share.is_some();
+                                session.set_active(active);
+                                self.capture = Some(session);
+                                // Re-create the preview at the new size.
+                                self.preview = None;
+                                // The new source looks nothing like the old
+                                // one: send an IDR immediately and resend
+                                // the cursor shape for the new frame.
+                                if let Some(share) = &self.share {
+                                    share.force_keyframe.store(true, Ordering::Relaxed);
+                                }
+                                self.cursor_sent = None;
+                                self.fps_last = std::time::Instant::now();
+                                self.fps_frames = 0;
+                            }
+                            // Keep the old session alive on failure: the
+                            // stream must not die because a pick failed.
+                            Err(error) => self.preview_error = Some(error),
+                        }
+                    }
+                }
+                crate::source::SwapAction::DropIdle => {
+                    // Idle capture: the next Preview/Go Live builds it fresh.
+                    self.capture = None;
+                    self.preview = None;
+                    self.preview_error = None;
+                }
+            }
+        }
 
         // Adaptive resolution is the primary control and stays in the open: it
         // starts at the ceiling and walks down only as far as the link and the
@@ -3374,71 +3422,129 @@ impl ArgosApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // Which Radmin network this PC is participating in. Disabled
-                // while a stream is live because it decides who may connect.
-                let busy = self.share.is_some() || self.view.is_some() || self.live;
-                if let Some(name) = self
+                let auto_room = self
+                    .config
                     .networks
-                    .picker(ui, &mut self.config, &self.allowed, busy)
-                {
-                    self.chat_panel.system_line(format!("— Network: {name} —"));
-                }
-                if self.config.allowed_ips().is_some_and(|set| set.is_empty()) {
+                    .iter()
+                    .find(|p| p.name == self.config.active_network)
+                    .is_some_and(|p| p.radmin);
+                if peers.is_empty() && auto_room {
                     ui.label(
-                        RichText::new("No one in this network yet — add IPs in Manage networks")
-                            .weak(),
+                        RichText::new(
+                            "Friends appear here automatically when they open Argos 1.5.1 or newer.",
+                        )
+                        .weak(),
+                    );
+                }
+                if peers.is_empty()
+                    && !auto_room
+                    && self.config.allowed_ips().is_some_and(|set| set.is_empty())
+                {
+                    ui.label(
+                        RichText::new(
+                            "No one in this network yet — add IPs in Manage networks",
+                        )
+                        .weak(),
                     );
                 }
                 ui.add_space(theme::SPACE_XS);
 
-                let people = match peers.len() {
-                    0 => "People".to_string(),
-                    n => format!("People ({n})"),
+                ui.add_space(12.0);
+                // Collapsible section header; the state is egui memory, so it
+                // lasts the session without cluttering the config file.
+                let people_id = ui.id().with("people_collapsed");
+                let mut people_collapsed =
+                    ui.data_mut(|d| d.get_temp::<bool>(people_id).unwrap_or(false));
+                // Plex has no ▾/▸ glyph, so the disclosure triangle is
+                // painted, not text — a missing glyph would render as tofu.
+                // The whole row is the click target, not just the label.
+                let (rect, header) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 20.0),
+                    egui::Sense::click(),
+                );
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(16.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("PEOPLE — {}", peers.len()),
+                    egui::FontId::proportional(theme::TEXT_S),
+                    theme::MUTED,
+                );
+                let c = rect.left_center() + egui::vec2(5.0, 0.0);
+                let points = if people_collapsed {
+                    vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(-2.0, 4.0), c + egui::vec2(4.0, 0.0)]
+                } else {
+                    vec![c + egui::vec2(-4.0, -2.0), c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 4.0)]
                 };
-                ui.add_space(theme::SPACE_XS);
-                ui.label(RichText::new(people).weak());
-
-                if self.lan.is_none() {
-                    ui.label(RichText::new("Peer discovery is unavailable").weak());
-                } else if peers.is_empty() {
-                    ui.label(RichText::new("Looking for people…").weak());
+                ui.painter().add(egui::Shape::convex_polygon(
+                    points,
+                    theme::MUTED,
+                    egui::Stroke::NONE,
+                ));
+                if header.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    people_collapsed = !people_collapsed;
+                    ui.data_mut(|d| d.insert_temp(people_id, people_collapsed));
                 }
+                ui.add_space(6.0);
 
-                for peer in &peers {
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(24.0);
-                        // The app's one loud element: a filled dot for a live
-                        // peer, an open ring for someone present but not
-                        // sharing. Everything after it stays quiet.
-                        let (dot, _) =
-                            ui.allocate_exact_size(egui::vec2(14.0, 24.0), egui::Sense::hover());
-                        if peer.sharing {
-                            ui.painter().circle_filled(dot.center(), 4.0_f32, theme::OK);
-                        } else {
-                            ui.painter().circle_stroke(
-                                dot.center(),
-                                4.0_f32,
-                                egui::Stroke::new(1.0_f32, theme::MUTED),
-                            );
+                if !people_collapsed {
+                    if self.lan.is_none() {
+                        ui.label(RichText::new("Peer discovery is unavailable").weak());
+                    } else if peers.is_empty() {
+                        ui.label(RichText::new("Looking for people…").weak());
+                    }
+
+                    for peer in &peers {
+                        let selected =
+                            matches!(&self.screen, Screen::Peer(id) if id == &peer.id);
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 44.0),
+                            egui::Sense::click(),
+                        );
+                        let peer_ctx = ui.ctx().clone();
+                        Self::paint_row_fill(ui, &peer_ctx, resp.id, &resp, selected);
+                        let inner = rect.shrink2(egui::vec2(6.0, 0.0));
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+                            ui.horizontal(|ui| {
+                                let name = peer.name.clone();
+                                let id = peer.id.clone();
+                                let av = widgets::avatar(ui, &name, &id, 32.0);
+                                widgets::status_dot(
+                                    ui.painter(),
+                                    av.rect.right_bottom() - egui::vec2(4.0, 4.0),
+                                    if peer.sharing {
+                                        widgets::DotKind::Live
+                                    } else {
+                                        widgets::DotKind::Online
+                                    },
+                                    theme::SIDEBAR,
+                                );
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&name));
+                                    ui.label(
+                                        RichText::new(if peer.sharing {
+                                            "Sharing"
+                                        } else {
+                                            "Online"
+                                        })
+                                        .weak()
+                                        .size(theme::TEXT_S),
+                                    );
+                                });
+                                if peer.sharing {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            widgets::live_pill(ui);
+                                        },
+                                    );
+                                }
+                            });
+                        });
+                        if peer.sharing && resp.clicked() {
+                            self.screen = Screen::Peer(peer.id.clone());
                         }
-                        if peer.sharing {
-                            let selected =
-                                matches!(&self.screen, Screen::Peer(id) if id == &peer.id);
-                            // Full width so the selection reads as a row, not a
-                            // word-sized button.
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 24.0],
-                                    egui::Button::selectable(selected, RichText::new(&peer.name)),
-                                )
-                                .clicked()
-                            {
-                                self.screen = Screen::Peer(peer.id.clone());
-                            }
-                        } else {
-                            ui.label(RichText::new(&peer.name).color(theme::MUTED));
-                        }
-                    });
+                        ui.add_space(6.0);
+                    }
                 }
 
                 if self.pending_view.is_some() {
@@ -3466,7 +3572,7 @@ impl ArgosApp {
                     ui.label(RichText::new(error).color(theme::ERR));
                 }
                 ui.add_space(theme::SPACE_S);
-                egui::CollapsingHeader::new("Advanced")
+                egui::CollapsingHeader::new(RichText::new("Advanced").weak())
                     .default_open(false)
                     .show(ui, |ui| {
                         // Only while there is nothing to attach a code to: once a
@@ -3908,27 +4014,39 @@ impl ArgosApp {
         });
     }
 
-    fn welcome(&self, ui: &mut egui::Ui) {
-        ui.horizontal_top(|ui| {
-            if let Some(icon) = &self.icon {
-                // The lockup: the app's own mark beside its words, so the first
-                // screen reads as Argos rather than as a form.
-                ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(56.0, 56.0)));
-                ui.add_space(theme::SPACE_M);
-            }
-            ui.vertical(|ui| {
-                ui.heading("Argos");
-                ui.add_space(theme::SPACE_S);
-                ui.label("Pick someone to watch, or press Share to stream your screen.");
-                ui.add_space(theme::SPACE_S);
-                ui.label(
-                    RichText::new(
-                        "Everyone on your Radmin network sees each other. No accounts, no servers.",
-                    )
-                    .weak(),
-                );
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        let mut go_share = false;
+        egui::Frame::NONE
+            .fill(theme::SURFACE)
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS_L))
+            .inner_margin(egui::Margin::same(20))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(theme::SPACE_M);
+                    if let Some(icon) = &self.icon {
+                        ui.add(egui::Image::new(icon).fit_to_exact_size(egui::vec2(96.0, 96.0)));
+                    }
+                    ui.add_space(theme::SPACE_M);
+                    ui.label(RichText::new("Welcome to Argos").size(theme::TEXT_L).strong());
+                    ui.add_space(theme::SPACE_S);
+                    ui.label("Pick someone to watch, or press Share to stream your screen.");
+                    ui.add_space(theme::SPACE_XS);
+                    ui.label(
+                        RichText::new(
+                            "Everyone on your Radmin network sees each other. No accounts, no servers.",
+                        )
+                        .weak(),
+                    );
+                    ui.add_space(theme::SPACE_M);
+                    if widgets::primary_button(ui, "Share your screen").clicked() {
+                        go_share = true;
+                    }
+                    ui.add_space(theme::SPACE_M);
+                });
             });
-        });
+        if go_share {
+            self.screen = Screen::Share;
+        }
     }
 
     /// One line of the stage-timing table. The peak column is the important
@@ -4287,10 +4405,12 @@ impl ArgosApp {
                 sink,
                 "packets",
                 format!(
-                    "{} ({:.0}/s), {} lost, {:.2} Mbps",
+                    "{} ({:.0}/s), {} lost ({} recovered, {} dropped), {:.2} Mbps",
                     m.packets.get(),
                     m.packets.get() as f32 / secs,
                     m.sequence_losses.get(),
+                    m.recovered_gaps.get(),
+                    m.dropped_frames.get(),
                     m.bytes.get() as f32 * 8.0 / secs / 1_000_000.0
                 ),
             );
@@ -4524,17 +4644,61 @@ impl ArgosApp {
         }
     }
 
+    /// The hover/selected fill for a channel row: fades toward a soft
+    /// HOVER at 60% alpha rather than snapping on.
+    fn paint_row_fill(
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        id: egui::Id,
+        resp: &egui::Response,
+        selected: bool,
+    ) {
+        let fill = if selected {
+            theme::RAISED
+        } else {
+            let t = ctx.animate_bool_with_time(id, resp.hovered(), 0.12);
+            theme::HOVER.gamma_multiply(0.6 * t)
+        };
+        ui.painter()
+            .rect_filled(resp.rect, egui::CornerRadius::same(theme::RADIUS), fill);
+    }
+
+    /// Which central screen is showing — the key the fade-in is driven by.
+    fn screen_key(screen: &Screen) -> u8 {
+        match screen {
+            Screen::Home => 0,
+            Screen::Share => 1,
+            Screen::Peer(_) => 2,
+            Screen::View => 3,
+        }
+    }
+
     fn content(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| match self.screen.clone() {
-                    // Text screens sit in a centred column; the video screens
-                    // keep the full width so the stream is not shrunk.
-                    Screen::Home => text_column(ui, |ui| self.welcome(ui)),
-                    Screen::Share => text_column(ui, |ui| self.share_view(ui)),
-                    Screen::Peer(id) => self.peer_view(ui, ctx, &id),
-                    Screen::View => self.watch_view(ui, ctx),
+                .show(ui, |ui| {
+                    // Screen changes fade in over ~150 ms. Video surfaces get
+                    // the same alpha — by the time frames arrive the fade is
+                    // done, so playback itself is never dimmed.
+                    let key = Self::screen_key(&self.screen);
+                    if key != self.screen_fade_key {
+                        self.screen_fade_key = key;
+                        self.screen_fade_at = std::time::Instant::now();
+                    }
+                    let t = (self.screen_fade_at.elapsed().as_secs_f32() / 0.15).min(1.0);
+                    if t < 1.0 {
+                        ctx.request_repaint();
+                    }
+                    ui.set_opacity(t);
+                    match self.screen.clone() {
+                        // Text screens sit in a centred column; the video screens
+                        // keep the full width so the stream is not shrunk.
+                        Screen::Home => text_column(ui, |ui| self.welcome(ui)),
+                        Screen::Share => text_column(ui, |ui| self.share_view(ui)),
+                        Screen::Peer(id) => self.peer_view(ui, ctx, &id),
+                        Screen::View => self.watch_view(ui, ctx),
+                    }
                 });
         });
     }
@@ -4696,6 +4860,10 @@ impl eframe::App for ArgosApp {
         if ctx.input_mut(|input| input.key_pressed(egui::Key::D) && input.modifiers.ctrl) {
             self.show_metrics = !self.show_metrics;
         }
+        if ctx.input_mut(|input| input.key_pressed(egui::Key::B) && input.modifiers.ctrl) {
+            self.config.sidebar_collapsed = !self.config.sidebar_collapsed;
+            let _ = config::save(&self.config);
+        }
         let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
         if ctx.input(|input| fullscreen_key(input, fullscreen)) {
             self.set_fullscreen(ctx, !fullscreen);
@@ -4703,6 +4871,20 @@ impl eframe::App for ArgosApp {
         theme::apply(ctx);
         self.poll_lan_events(ctx);
         self.poll_chat_events(ctx);
+        let busy = self.share.is_some() || self.view.is_some() || self.live;
+        if self
+            .networks
+            .drain_sync(&mut self.config, self.lan.as_ref(), busy)
+        {
+            if let Err(error) = config::save(&self.config) {
+                self.share_error = Some(format!("config save failed: {error}"));
+            }
+            self.refresh_allowed();
+        }
+        if self.allowed_tick.elapsed() > std::time::Duration::from_secs(1) {
+            self.allowed_tick = std::time::Instant::now();
+            self.refresh_allowed();
+        }
         // A window close tears the process down without any other teardown path,
         // so the viewers are told here, once.
         if self.share.is_some()
@@ -4717,6 +4899,7 @@ impl eframe::App for ArgosApp {
         let fullscreen = self.view.as_ref().is_some_and(|view| view.fullscreen);
         if !fullscreen {
             self.title_bar(ctx);
+            self.server_rail(ctx);
             self.side_bar(ctx);
         }
         if self.capture.is_some() {
@@ -4774,6 +4957,273 @@ impl eframe::App for ArgosApp {
             self.networks
                 .window(ctx, &mut self.config, &self.allowed, self.lan.as_ref());
         }
+        if let Some(icon) = &self.icon {
+            self.splash.show(ctx, icon);
+        }
+    }
+}
+
+impl ArgosApp {
+    /// Rebuilds the shared `Allowed` from the active room: manual IPs plus
+    /// the live peers advertising that Radmin tag. Runs on a ~1 s cadence and
+    /// on every room switch.
+    fn refresh_allowed(&mut self) {
+        let set = self
+            .config
+            .networks
+            .iter()
+            .find(|p| p.name == self.config.active_network)
+            .map(|profile| {
+                Networks::room_allowed(
+                    profile,
+                    &self
+                        .lan
+                        .as_ref()
+                        .map(|lan| lan.all_peers())
+                        .unwrap_or_default(),
+                )
+            });
+        // `None` profile = "All" = no filter; `Some` room = its allow set.
+        if let Ok(mut allowed) = self.allowed.write() {
+            *allowed = set;
+        }
+    }
+
+    /// The server rail: logo, "All", one circle per network, "+".
+    fn server_rail(&mut self, ctx: &egui::Context) {
+        let busy = self.share.is_some() || self.view.is_some() || self.live;
+        let mut switch: Option<String> = None;
+        let mut expand = false;
+        let mut badge_rect: Option<egui::Rect> = None;
+        let peer_count = self.lan.as_ref().map(|lan| lan.peers().len()).unwrap_or(0);
+        let collapsed = self.config.sidebar_collapsed;
+        egui::SidePanel::left("server_rail")
+            .resizable(false)
+            .exact_width(theme::RAIL_WIDTH)
+            .frame(egui::Frame::NONE.fill(theme::RAIL))
+            .show(ctx, |ui| {
+                ui.add_space(theme::SPACE_S);
+                if let Some(icon) = &self.icon {
+                    let resp = Self::rail_item(
+                        ui,
+                        ctx,
+                        "rail_home",
+                        "Argos",
+                        false,
+                        |ui, rect, _| {
+                            ui.painter().image(
+                                icon.id(),
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
+                                Color32::WHITE,
+                            );
+                        },
+                        busy,
+                    );
+                    if resp.clicked() {
+                        self.screen = Screen::Home;
+                    }
+                }
+                let sep = egui::Rect::from_center_size(
+                    ui.cursor().left_top() + egui::vec2(24.0, 4.0),
+                    egui::vec2(32.0, 1.0),
+                );
+                ui.painter()
+                    .rect_filled(sep, egui::CornerRadius::ZERO, theme::BORDER);
+                ui.add_space(theme::SPACE_S);
+                let all_sel = self.config.active_network.is_empty();
+                if Self::rail_item(
+                    ui,
+                    ctx,
+                    "rail_all",
+                    "All (no filter)",
+                    all_sel,
+                    |ui, rect, _| {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "All",
+                            egui::FontId::proportional(theme::TEXT_M),
+                            theme::TEXT,
+                        );
+                    },
+                    busy,
+                )
+                .clicked()
+                {
+                    switch = Some(String::new());
+                }
+                let names: Vec<(String, bool)> = self
+                    .config
+                    .networks
+                    .iter()
+                    .map(|p| (p.name.clone(), p.radmin))
+                    .collect();
+                for (name, radmin) in names {
+                    let sel = self.config.active_network == name;
+                    let seed = name.clone();
+                    let label = name.clone();
+                    let tooltip = if radmin {
+                        format!("{name} · Radmin")
+                    } else {
+                        name.clone()
+                    };
+                    let resp = Self::rail_item(
+                        ui,
+                        ctx,
+                        &format!("rail_{name}"),
+                        &tooltip,
+                        sel,
+                        move |ui, rect, _| {
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                rect.width() / 2.0,
+                                widgets::avatar_color(&seed),
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                widgets::initials(&label),
+                                egui::FontId::proportional(theme::TEXT_M),
+                                Color32::WHITE,
+                            );
+                        },
+                        busy,
+                    );
+                    if sel && collapsed {
+                        badge_rect = Some(resp.rect);
+                    }
+                    if resp.clicked() {
+                        switch = Some(name);
+                    }
+                }
+                if collapsed
+                    && Self::rail_item(
+                        ui,
+                        ctx,
+                        "rail_expand",
+                        "Expand sidebar",
+                        false,
+                        |ui, rect, _| {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "»",
+                                egui::FontId::proportional(theme::TEXT_M),
+                                theme::ACCENT,
+                            );
+                        },
+                        false,
+                    )
+                    .clicked()
+                {
+                    expand = true;
+                }
+                if Self::rail_item(
+                    ui,
+                    ctx,
+                    "rail_plus",
+                    "Manage networks",
+                    false,
+                    |ui, rect, _| {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "+",
+                            egui::FontId::proportional(theme::TEXT_L),
+                            theme::ACCENT,
+                        );
+                    },
+                    false,
+                )
+                .clicked()
+                {
+                    self.networks.open_manager();
+                }
+                // The count badge rides on the active room's circle while the
+                // sidebar is folded away — the only place the count shows.
+                if let Some(rect) = badge_rect {
+                    if peer_count > 0 {
+                        let c = rect.right_bottom() - egui::vec2(10.0, 10.0);
+                        ui.painter().circle_filled(c, 9.0, theme::ACCENT_FILL);
+                        ui.painter()
+                            .circle_stroke(c, 9.0, egui::Stroke::new(1.5_f32, theme::RAIL));
+                        ui.painter().text(
+                            c,
+                            egui::Align2::CENTER_CENTER,
+                            peer_count.min(99).to_string(),
+                            egui::FontId::proportional(theme::TEXT_S),
+                            Color32::WHITE,
+                        );
+                    }
+                }
+            });
+        if expand {
+            self.config.sidebar_collapsed = false;
+            let _ = config::save(&self.config);
+        }
+        if let Some(name) = switch {
+            let label = self.networks.select(&mut self.config, &self.allowed, name);
+            self.refresh_allowed();
+            self.chat_panel.system_line(format!("— Network: {label} —"));
+            // Clicking the already-selected room also unfolds the sidebar.
+            if self.config.sidebar_collapsed {
+                self.config.sidebar_collapsed = false;
+                let _ = config::save(&self.config);
+            }
+        }
+    }
+
+    /// One 48px rail item: circle that morphs toward a rounded square on
+    /// hover/selection, with the white pill on the rail's left edge.
+    fn rail_item(
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        id: &str,
+        tooltip: &str,
+        selected: bool,
+        draw: impl Fn(&mut egui::Ui, egui::Rect, bool),
+        disabled: bool,
+    ) -> egui::Response {
+        let t =
+            ctx.animate_value_with_time(ui.id().with(id), if selected { 1.0 } else { 0.0 }, 0.15);
+        let desired = egui::vec2(theme::RAIL_WIDTH, 56.0);
+        let (outer, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let rect = egui::Rect::from_center_size(outer.center(), egui::vec2(48.0, 48.0));
+        let mut resp = ui.interact(rect, ui.id().with(id).with("btn"), egui::Sense::click());
+        if disabled {
+            resp = resp.on_disabled_hover_text("Stop sharing/watching to switch networks");
+        } else {
+            resp = resp.on_hover_text(tooltip);
+        }
+        let morph = ((1.0 - t) * 24.0 + t * 16.0) * (1.0 - if resp.hovered() { 0.5 } else { 0.0 });
+        let radius = morph.clamp(8.0, 24.0) as u8;
+        let fill = if disabled {
+            theme::RAISED.gamma_multiply(0.5)
+        } else if resp.hovered() {
+            theme::HOVER
+        } else {
+            theme::RAISED
+        };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(radius), fill);
+        let pill_h = if selected {
+            40.0
+        } else if resp.hovered() {
+            20.0
+        } else {
+            0.0
+        };
+        if pill_h > 0.0 {
+            let pill = egui::Rect::from_center_size(
+                outer.left_center() + egui::vec2(2.0, 0.0),
+                egui::vec2(4.0, pill_h),
+            );
+            ui.painter()
+                .rect_filled(pill, egui::CornerRadius::same(2), Color32::WHITE);
+        }
+        draw(ui, rect, selected);
+        resp
     }
 }
 

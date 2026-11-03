@@ -25,6 +25,8 @@ pub struct LanPeer {
     /// build that has no chat — old builds never send the field.
     pub chat_port: u16,
     pub sharing: bool,
+    /// The `network_tag`s their hello advertises — empty for old builds.
+    pub radmin_networks: Vec<String>,
     pub last_seen: Instant,
 }
 
@@ -327,6 +329,24 @@ struct Message {
     /// The sharer's pointer, in the `cursor` message.
     #[serde(default)]
     cursor: Option<CursorUpdate>,
+    /// The Radmin networks the sender belongs to, in the `hello` message, as
+    /// `network_tag` hashes — names stay private off-network.
+    #[serde(default)]
+    radmin_networks: Vec<String>,
+}
+
+/// A privacy-preserving name for a Radmin network on the wire: the first 16
+/// hex chars of its salted SHA-256. Peers can compare tags to learn shared
+/// membership without learning the network's actual name.
+pub fn network_tag(name: &str) -> String {
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("argos-radmin-net:{name}").as_bytes(),
+    );
+    digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub struct Lan {
@@ -340,6 +360,8 @@ pub struct Lan {
     name: Arc<Mutex<String>>,
     sharing: Arc<AtomicBool>,
     local: Arc<Mutex<Option<Ipv4Addr>>>,
+    /// The `network_tag`s this machine advertises; swapped by the sync.
+    radmin_networks: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
 }
@@ -358,6 +380,7 @@ impl Lan {
         let name = Arc::new(Mutex::new(name));
         let sharing = Arc::new(AtomicBool::new(false));
         let local = Arc::new(Mutex::new(find_vpn_address()));
+        let radmin_networks = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (events_tx, events) = channel();
 
@@ -370,6 +393,7 @@ impl Lan {
         let discovery_local = Arc::clone(&local);
         let discovery_stop = Arc::clone(&stop);
         let discovery_allowed = Arc::clone(&allowed);
+        let discovery_radmin = Arc::clone(&radmin_networks);
         let discovery_id = id.clone();
         joins.push(
             thread::Builder::new()
@@ -383,6 +407,7 @@ impl Lan {
                         discovery_local,
                         discovery_stop,
                         discovery_allowed,
+                        discovery_radmin,
                         discovery_id,
                         signal_port,
                         chat_port,
@@ -421,6 +446,7 @@ impl Lan {
             name,
             sharing,
             local,
+            radmin_networks,
             stop,
             joins,
         })
@@ -442,6 +468,14 @@ impl Lan {
 
     pub fn set_sharing(&self, sharing: bool) {
         self.sharing.store(sharing, Ordering::Relaxed);
+    }
+
+    /// Swaps the Radmin tags this machine advertises. Read fresh every beacon,
+    /// so a sync changes the hello without restarting discovery.
+    pub fn set_radmin_networks(&self, tags: Vec<String>) {
+        if let Ok(mut slot) = self.radmin_networks.lock() {
+            *slot = tags;
+        }
     }
 
     /// The peers the active network admits, sorted by name.
@@ -514,6 +548,7 @@ impl Lan {
             roster: Vec::new(),
             source_fps: 0,
             cursor: None,
+            radmin_networks: Vec::new(),
         }
     }
 
@@ -697,6 +732,7 @@ fn discovery_loop(
     local: Arc<Mutex<Option<Ipv4Addr>>>,
     stop: Arc<AtomicBool>,
     allowed: Allowed,
+    radmin_networks: Arc<Mutex<Vec<String>>>,
     id: String,
     signal_port: u16,
     chat_port: u16,
@@ -727,6 +763,10 @@ fn discovery_loop(
                 roster: Vec::new(),
                 source_fps: 0,
                 cursor: None,
+                radmin_networks: radmin_networks
+                    .lock()
+                    .map(|set| set.clone())
+                    .unwrap_or_default(),
             };
             if let Ok(json) = serde_json::to_vec(&message) {
                 for target in &targets {
@@ -772,6 +812,7 @@ fn discovery_loop(
                         addr: SocketAddr::new(addr.ip(), message.port),
                         chat_port: message.chat_port,
                         sharing: message.sharing,
+                        radmin_networks: message.radmin_networks,
                         last_seen: Instant::now(),
                     };
                     if let Some(prev) = peers.get(&peer.id) {

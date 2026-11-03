@@ -3,9 +3,11 @@ use std::future::Future;
 use std::sync::{Arc, LockResult, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use rtc::interceptor::Registry;
+use rtc::interceptor::{NackGeneratorBuilder, NackResponderBuilder, Registry, Slot};
 use rtc::media_stream::MediaStreamTrack;
-use rtc::peer_connection::configuration::interceptor_registry::register_default_interceptors;
+use rtc::peer_connection::configuration::interceptor_registry::{
+    configure_rtcp_reports, configure_simulcast_extension_headers, configure_twcc_receiver_only,
+};
 use rtc::peer_connection::configuration::media_engine::{
     MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS,
 };
@@ -13,8 +15,8 @@ use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::rtp::packet::Packet;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters, RTCRtpEncodingParameters,
-    RtpCodecKind,
+    RTCPFeedback, RTCRtpCodec, RTCRtpCodecParameters, RTCRtpCodingParameters,
+    RTCRtpEncodingParameters, RtpCodecKind,
 };
 use rtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
@@ -168,7 +170,16 @@ fn h264_codec() -> RTCRtpCodec {
         channels: 0,
         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
             .to_owned(),
-        rtcp_feedback: vec![],
+        rtcp_feedback: vec![
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: String::new(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            },
+        ],
     }
 }
 
@@ -212,8 +223,40 @@ async fn build_pc(
             RtpCodecKind::Audio,
         )
         .map_err(|error| error.to_string())?;
-    let registry = register_default_interceptors(Registry::new(), &mut engine)
-        .map_err(|error| error.to_string())?;
+    // register_default_interceptors minus its stock NACK: ours retransmits
+    // from a 4x deeper buffer and asks for missing packets every 20 ms
+    // instead of every 100 ms, which is what actually keeps the stream
+    // smooth on a lossy Radmin tunnel.
+    engine.register_feedback(
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: String::new(),
+        },
+        RtpCodecKind::Video,
+    );
+    engine.register_feedback(
+        RTCPFeedback {
+            typ: "nack".to_owned(),
+            parameter: "pli".to_owned(),
+        },
+        RtpCodecKind::Video,
+    );
+    let registry = Registry::new()
+        .with(
+            Slot::NackResponder,
+            NackResponderBuilder::new().with_size(4096).build(),
+        )
+        .with(
+            Slot::NackGenerator,
+            NackGeneratorBuilder::new()
+                .with_interval(Duration::from_millis(20))
+                .with_size(2048)
+                .build(),
+        );
+    configure_simulcast_extension_headers(&mut engine).map_err(|error| error.to_string())?;
+    let registry =
+        configure_twcc_receiver_only(registry, &mut engine).map_err(|error| error.to_string())?;
+    let registry = configure_rtcp_reports(registry);
     let pc: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
             .with_configuration(RTCConfigurationBuilder::new().build())
@@ -339,6 +382,22 @@ struct WriteTarget {
     write: Arc<Ema>,
 }
 
+/// Packets sent back-to-back before a pacing pause. Eight keeps the bursts
+/// small enough that a lossy link sheds individual packets, not the whole
+/// tail of a frame.
+const PACE_CHUNK: usize = 8;
+
+/// How long to sleep between [`PACE_CHUNK`] groups, or `None` when the frame
+/// is small enough to send in one go. The budget is 70% of the frame interval
+/// so pacing never delays the *next* frame.
+pub fn pace_delay(packet_count: usize, frame_interval: Duration) -> Option<Duration> {
+    if packet_count <= PACE_CHUNK * 2 {
+        return None;
+    }
+    let chunks = packet_count.div_ceil(PACE_CHUNK) as u32;
+    Some(frame_interval.mul_f64(0.7) / chunks)
+}
+
 pub struct Sharer {
     /// Live connections, keyed by the viewer's id.
     ///
@@ -353,6 +412,9 @@ pub struct Sharer {
     /// refcount bump rather than a copy.
     packetizer: Mutex<Packetizer>,
     audio_packetizer: Mutex<Packetizer>,
+    /// RTP timestamp of the previous frame — the delta to the current one is
+    /// the real cadence the pacing budget is measured against.
+    last_ts: Mutex<Option<u32>>,
 }
 
 impl Sharer {
@@ -362,6 +424,7 @@ impl Sharer {
             udp_addrs,
             packetizer: Mutex::new(Packetizer::new(VIDEO_SSRC, VIDEO_PT, MTU)),
             audio_packetizer: Mutex::new(Packetizer::new(AUDIO_SSRC, AUDIO_PT, MTU)),
+            last_ts: Mutex::new(None),
         }
     }
 
@@ -562,6 +625,23 @@ impl Sharer {
         if targets.is_empty() {
             return Ok(());
         }
+        // Pace big frames so they reach the wire as a stream, not a burst.
+        // The cadence comes from the last timestamp delta rather than a config
+        // value, so it tracks the ladder's real frame rate. Budget: at most
+        // 70% of the interval, and small frames still go out as one shot.
+        let interval = {
+            let mut last = unpoison(self.last_ts.lock());
+            let previous = *last;
+            *last = Some(timestamp);
+            previous
+                .map(|prev| {
+                    Duration::from_secs_f64(
+                        timestamp.wrapping_sub(prev) as f64 / h264::RTP_CLOCK_RATE as f64,
+                    )
+                })
+                .unwrap_or(Duration::from_millis(33))
+        };
+        let pace = pace_delay(packets.len(), interval);
         let _write = StageTimer::new(&metrics.write);
         let mut failed = Vec::new();
         for target in targets {
@@ -570,6 +650,7 @@ impl Sharer {
             // costing it to, which is the difference between "the stream is
             // heavy" and "this one viewer's link is not keeping up".
             let _viewer_write = StageTimer::new(&target.write);
+            let mut sent = 0usize;
             for packet in &packets {
                 if let Err(_error) = target.track.write_rtp(packet.clone()).await {
                     metrics.write_errors.incr();
@@ -577,6 +658,12 @@ impl Sharer {
                         failed.push(target.id);
                     }
                     break;
+                }
+                sent += 1;
+                if let Some(delay) = pace {
+                    if sent.is_multiple_of(PACE_CHUNK) {
+                        tokio::time::sleep(delay).await;
+                    }
                 }
             }
         }
@@ -818,5 +905,58 @@ mod tests {
     fn a_healthy_lock_takes_the_same_path() {
         let lock = Mutex::new(vec![7u32]);
         assert_eq!(*unpoison(lock.lock()), vec![7]);
+    }
+
+    /// Small frames go out in one shot; only a big burst gets spread, and it
+    /// always fits inside 70% of the frame interval so pacing can never make
+    /// the next frame late.
+    #[test]
+    fn pacing_skips_small_frames_and_bounds_the_spread() {
+        use super::{pace_delay, PACE_CHUNK};
+        use std::time::Duration;
+        assert_eq!(pace_delay(8, Duration::from_millis(33)), None);
+        assert_eq!(pace_delay(16, Duration::from_millis(33)), None);
+        let delay = pace_delay(200, Duration::from_millis(33)).unwrap();
+        // 200 packets / 8 per chunk = 25 gaps at most.
+        assert!(delay * 25 < Duration::from_millis(33), "{delay:?}");
+        assert!(delay >= Duration::from_micros(100));
+        // At 60 fps the same frame still fits its smaller budget.
+        let delay = pace_delay(200, Duration::from_millis(16)).unwrap();
+        assert!(delay * 25 < Duration::from_millis(16), "{delay:?}");
+        let _ = PACE_CHUNK;
+    }
+
+    /// The media engine hands the negotiated codec parameters to the track —
+    /// NACK and PLI must be on them, or the receiver can never ask for a
+    /// retransmission. This mirrors what the SDP writer sees without needing a
+    /// live connection.
+    #[test]
+    fn nack_feedback_reaches_the_negotiated_codec() {
+        use super::h264_codec;
+        use rtc::peer_connection::configuration::media_engine::MediaEngine;
+        use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RtpCodecKind};
+        let mut engine = MediaEngine::default();
+        engine.register_feedback(
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: String::new(),
+            },
+            RtpCodecKind::Video,
+        );
+        let codec = h264_codec();
+        assert!(
+            codec
+                .rtcp_feedback
+                .iter()
+                .any(|f| f.typ == "nack" && f.parameter.is_empty()),
+            "codec must offer generic nack"
+        );
+        assert!(
+            codec
+                .rtcp_feedback
+                .iter()
+                .any(|f| f.typ == "nack" && f.parameter == "pli"),
+            "codec must offer nack pli"
+        );
     }
 }

@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "argos-app"
-version = "1.4.2"
+version = "1.6.0"
 dependencies = [
  "arboard",
  "argos-core",
@@ -226,13 +226,14 @@ dependencies = [
 
 [[package]]
 name = "argos-core"
-version = "1.4.2"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "if-addrs",
+ "ring",
  "rtc",
  "serde",
  "serde_json",
@@ -243,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "argos-media"
-version = "1.4.2"
+version = "1.6.0"
 dependencies = [
  "argos-core",
  "openh264",

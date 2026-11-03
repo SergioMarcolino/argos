@@ -17,6 +17,31 @@ pub struct SourcePicker {
     selection: SourceSel,
     /// Set when a refresh found the chosen window gone.
     notice: Option<String>,
+    /// Whether the combo popup was open last frame — opening it re-enumerates
+    /// so a window started after launch appears without pressing ↻.
+    popup_was_open: bool,
+}
+
+/// What to do with the running capture when the user picks a new source:
+/// rebuild it live ([`SwapAction::Swap`]) or drop an idle one.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwapAction {
+    /// A stream or preview is running: the new source must hot-swap onto a
+    /// fresh session so the picture never stops.
+    Swap,
+    /// Nothing is running: the old session is stale — drop it and let the
+    /// next start build a fresh one.
+    DropIdle,
+}
+
+/// The pick is always allowed now; this decides what the pick does to a
+/// capture that may or may not be running.
+pub fn swap_action(live: bool, sharing: bool, previewing: bool) -> SwapAction {
+    if live || sharing || previewing {
+        SwapAction::Swap
+    } else {
+        SwapAction::DropIdle
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -35,6 +60,7 @@ impl SourcePicker {
             supported: capture::window_capture_supported(),
             selection: SourceSel::Monitor(String::new()),
             notice: None,
+            popup_was_open: false,
         }
     }
 
@@ -98,10 +124,11 @@ impl SourcePicker {
         matches!(self.selection, SourceSel::Window(_))
     }
 
-    /// The combo plus its refresh button. Disabled while a capture is live —
-    /// a source change mid-stream silently did nothing before, which read as
-    /// a bug rather than a rule.
-    pub fn picker(&mut self, ui: &mut egui::Ui, busy: bool) {
+    /// The combo plus its refresh button. Never disabled: picking a source
+    /// mid-stream hot-swaps the capture. Returns `true` when the selection
+    /// changed, so the caller can swap or drop the old session.
+    pub fn picker(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
         ui.horizontal(|ui| {
             let label = match self.source() {
                 Some(CaptureSource::Monitor(m)) => format!("Screen: {}", monitor_label(&m)),
@@ -110,8 +137,15 @@ impl SourcePicker {
                 }
                 None => "No source".to_string(),
             };
-            ui.add_enabled_ui(!busy, |ui| {
-                let response = egui::ComboBox::from_label("Source")
+            {
+                // Re-enumerate on open: a window launched since the last
+                // refresh would otherwise be invisible until ↻.
+                let open_now = egui::Popup::is_id_open(ui.ctx(), ui.id().with("source_picker"));
+                if open_now && !self.popup_was_open {
+                    self.refresh();
+                }
+                self.popup_was_open = open_now;
+                let response = egui::ComboBox::from_id_salt("source_picker")
                     .selected_text(label)
                     .show_ui(ui, |ui| {
                         for monitor in &self.monitors {
@@ -125,6 +159,7 @@ impl SourcePicker {
                             {
                                 self.selection = SourceSel::Monitor(monitor.name.clone());
                                 self.notice = None;
+                                changed = true;
                             }
                         }
                         if !self.windows.is_empty() {
@@ -141,15 +176,12 @@ impl SourcePicker {
                             {
                                 self.selection = SourceSel::Window(window.hwnd);
                                 self.notice = None;
+                                changed = true;
                             }
                         }
                     });
-                if busy {
-                    response
-                        .response
-                        .on_disabled_hover_text("Stop sharing and preview to change the source");
-                }
-            });
+                let _ = response;
+            }
             if ui
                 .small_button("↻")
                 .on_hover_text("Refresh sources")
@@ -164,6 +196,7 @@ impl SourcePicker {
         if self.is_window() {
             ui.label(RichText::new("Audio: whole system sound is shared").weak());
         }
+        changed
     }
 }
 

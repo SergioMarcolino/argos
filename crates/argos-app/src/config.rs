@@ -21,6 +21,10 @@ pub struct NetworkProfile {
     pub name: String,
     #[serde(default)]
     pub ips: Vec<String>,
+    /// The room mirrors a Radmin network of the same name: membership comes
+    /// from peers' hellos rather than the manual list alone.
+    #[serde(default)]
+    pub radmin: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -37,6 +41,58 @@ pub struct AppConfig {
     /// The active profile's name; empty means no filter ("All").
     #[serde(default)]
     pub active_network: String,
+    /// Auto rooms the user deleted by name — the sync must not recreate them.
+    #[serde(default)]
+    pub dismissed_radmin: Vec<String>,
+    /// The channel sidebar folded away (rail only).
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+}
+
+/// Reconciles the profile list with what Radmin reports: a room for every
+/// Radmin network (unless dismissed), stale auto rooms removed, manual rooms
+/// untouched. Returns the new list and whether it changed.
+///
+/// `keep` is the name of an auto room that must survive this round even if
+/// Radmin dropped it — the caller defers removal while it is in use.
+pub fn merge_radmin(
+    profiles: &[NetworkProfile],
+    dismissed: &[String],
+    radmin_names: &[String],
+    keep: Option<&str>,
+) -> (Vec<NetworkProfile>, bool) {
+    let mut out = profiles.to_vec();
+    let mut changed = false;
+    // Drop auto rooms Radmin no longer reports (manual rooms are never
+    // touched by the sync).
+    out.retain(|profile| {
+        let stale = profile.radmin
+            && !radmin_names.contains(&profile.name)
+            && keep != Some(profile.name.as_str());
+        changed |= stale;
+        !stale
+    });
+    for name in radmin_names {
+        if dismissed.contains(name) {
+            continue;
+        }
+        match out.iter_mut().find(|profile| profile.name == *name) {
+            Some(profile) if !profile.radmin => {
+                profile.radmin = true;
+                changed = true;
+            }
+            Some(_) => {}
+            None => {
+                out.push(NetworkProfile {
+                    name: name.clone(),
+                    ips: Vec::new(),
+                    radmin: true,
+                });
+                changed = true;
+            }
+        }
+    }
+    (out, changed)
 }
 
 impl AppConfig {
@@ -107,10 +163,12 @@ mod tests {
                 NetworkProfile {
                     name: "home".to_string(),
                     ips: vec!["26.0.0.7".to_string(), "not-an-ip".to_string()],
+                    ..Default::default()
                 },
                 NetworkProfile {
                     name: "empty".to_string(),
                     ips: Vec::new(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -129,5 +187,53 @@ mod tests {
 
         config.active_network = "deleted".to_string();
         assert!(config.allowed_ips().is_none());
+    }
+
+    /// The merge is the sync's whole logic: rooms appear for new Radmin
+    /// networks, vanish when Radmin drops them, and manual rooms survive.
+    #[test]
+    fn radmin_rooms_merge_without_disturbing_manual_ones() {
+        let profiles = vec![
+            NetworkProfile {
+                name: "manual".to_string(),
+                ips: vec!["26.0.0.1".to_string()],
+                radmin: false,
+            },
+            NetworkProfile {
+                name: "stale".to_string(),
+                ips: Vec::new(),
+                radmin: true,
+            },
+        ];
+        let names = vec!["manual".to_string(), "fresh".to_string()];
+        let (out, changed) = merge_radmin(&profiles, &[], &names, None);
+        assert!(changed);
+        // "stale" dropped, "fresh" added as radmin, manual untouched.
+        assert_eq!(
+            out.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["manual", "fresh"]
+        );
+        assert!(out[1].radmin);
+        // The manual profile gains the radmin flag, keeps its IPs.
+        assert!(out[0].radmin && out[0].ips == vec!["26.0.0.1".to_string()]);
+        // Idempotent: the same sync again changes nothing.
+        let (_, changed) = merge_radmin(&out, &[], &names, None);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn dismissed_rooms_are_not_recreated_and_keep_defers_removal() {
+        let names = vec!["gone".to_string()];
+        let (out, _) = merge_radmin(&[], &["gone".to_string()], &names, None);
+        assert!(out.is_empty());
+        // An in-use stale room survives one more round.
+        let stale = vec![NetworkProfile {
+            name: "stale".to_string(),
+            ips: Vec::new(),
+            radmin: true,
+        }];
+        let (out, changed) = merge_radmin(&stale, &[], &[], Some("stale"));
+        assert_eq!(out.len(), 1);
+        assert!(!changed);
     }
 }

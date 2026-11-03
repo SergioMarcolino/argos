@@ -13,7 +13,7 @@
 //! how often it dropped. A drop counter climbing while the matching stage's
 //! duration climbs points straight at the culprit.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -407,10 +407,17 @@ pub struct ReceiverMetrics {
     /// Audio frames handed to the playback device.
     pub audio_decoded: DropCounter,
     pub audio_errors: Counter,
-    /// Packets missing between consecutive sequence numbers. The transport has
-    /// no retransmission buffer, so each one is a permanently lost packet and
-    /// usually means a damaged frame waiting for the next keyframe.
+    /// Packets lost by sequence gap — what a viewer sees as missing data.
+    /// The reorder buffer may still rescue the frame if a retransmission
+    /// lands inside its window; only what it gives up on is truly gone.
     pub sequence_losses: Counter,
+    /// Gaps the reorder buffer later filled — loss survived, not suffered.
+    pub recovered_gaps: Counter,
+    /// Frames the reorder buffer gave up on after its deadline.
+    pub dropped_frames: Counter,
+    /// Set by the receiver when a frame goes Broken; the UI polls and clears
+    /// it to fire the immediate keyframe request.
+    pub broken: AtomicBool,
 
     /// Access units fed to the decoder.
     pub access_units: Counter,

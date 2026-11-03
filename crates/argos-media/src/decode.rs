@@ -103,7 +103,7 @@ impl SequenceTracker {
 /// serve it, made the loss accounting unit-testable, and left the UI file
 /// with nothing but the five-line packet callback glue.
 pub struct DecodeSink {
-    depacketizer: h264::Depacketizer,
+    assembler: argos_core::reorder::FrameAssembler,
     decoder: Option<H264Decoder>,
     audio_decoder: Option<OpusAudioDecoder>,
     /// The frame the UI presents on screen. `None` means the UI has consumed
@@ -131,7 +131,7 @@ impl DecodeSink {
         metrics: Arc<ReceiverMetrics>,
     ) -> Self {
         Self {
-            depacketizer: h264::Depacketizer::new(),
+            assembler: argos_core::reorder::FrameAssembler::new(),
             decoder: H264Decoder::new().ok(),
             audio_decoder: OpusAudioDecoder::new().ok(),
             latest,
@@ -206,13 +206,47 @@ impl DecodeSink {
             // viewer.
             self.metrics.sequence_losses.add(lost);
         }
-        let nalus = {
+        let outputs = {
             let _depacketize = StageTimer::new(&self.metrics.depacketize);
-            self.depacketizer.push(packet)
+            self.assembler.push(packet, std::time::Instant::now())
         };
-        let Some(nalus) = nalus else {
-            return;
-        };
+        self.drain_outputs(outputs);
+    }
+
+    /// Drive the reorder buffer's deadlines between packets. The caller
+    /// (UI tick, ~20 ms) must call this or a dying frame never reports Broken.
+    pub fn poll_deadline(&mut self) {
+        let outputs = self.assembler.poll(std::time::Instant::now());
+        self.drain_outputs(outputs);
+    }
+
+    /// Current wait of the oldest held packet, for the diagnostics panel.
+    pub fn hold_ms(&self) -> u64 {
+        self.assembler.hold_ms(std::time::Instant::now())
+    }
+
+    fn drain_outputs(&mut self, outputs: Vec<argos_core::reorder::Output>) {
+        for output in outputs {
+            match output {
+                argos_core::reorder::Output::Frame(nalus) => self.decode_nalus(nalus),
+                argos_core::reorder::Output::Broken => {
+                    // A frame died on its deadline: everything downstream of
+                    // it is useless until an IDR. Request one now.
+                    self.assembler = argos_core::reorder::FrameAssembler::new();
+                    self.metrics.dropped_frames.incr();
+                    self.metrics
+                        .broken
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let stats = self.assembler.stats;
+        if stats.recovered > self.metrics.recovered_gaps.get() {
+            self.metrics.recovered_gaps.set(stats.recovered);
+        }
+    }
+
+    fn decode_nalus(&mut self, nalus: Vec<Vec<u8>>) {
         self.metrics.access_units.incr();
         let Some(decoder) = self.decoder.as_mut() else {
             return;
@@ -246,7 +280,7 @@ impl DecodeSink {
                 // everything until the next keyframe rather than feeding it
                 // error-prone frames; the depacketizer's sync gate handles
                 // that once reset.
-                self.depacketizer.reset();
+                self.assembler = argos_core::reorder::FrameAssembler::new();
                 self.metrics.decode_errors.incr();
                 self.video_error.set(error);
             }
