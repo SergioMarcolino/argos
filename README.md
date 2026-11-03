@@ -8,6 +8,23 @@ directly.
 Windows only, and deliberately so: capture goes through the Desktop Duplication
 API, which is Windows-specific and has no equivalent elsewhere.
 
+## Download
+
+**[Download Argos 1.6.0 for Windows (argos-app-1.6.0.exe)](releases/argos-app-1.6.0.exe)**
+— on the file page, press the download button (↓). No installer: just run it.
+
+- SHA-256: `d469b1e00c4200dd2b2d25d0576be4a5f1c36277806ab90e9128720cadfb9d1f`
+- The exe is not code-signed, so Windows SmartScreen may warn the first time:
+  click **More info → Run anyway**.
+- Allow Argos through the Windows firewall when asked, or friends won't see you.
+- Everyone should use the same version: rooms from Radmin and chat need 1.5.1 or
+  newer on both sides, and loss recovery works best when both run 1.6.0.
+
+New in 1.6.0: a new look (rooms rail, collapsible sidebar with **Ctrl+B**),
+rooms created automatically from your Radmin VPN networks, network chat with
+images and files, sharing a single window, switching screen/window while live,
+and much better recovery from packet loss.
+
 ## Requirements
 
 - Windows, practically 10 or later. Capture uses the Desktop Duplication API,
